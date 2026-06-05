@@ -1,0 +1,46 @@
+version: "3.9"
+
+services:
+  beyondcolor:
+    build: .
+    image: beyondcolor:latest
+    container_name: beyondcolor_api
+    ports:
+      - "8001:8001"
+    environment:
+      - BEYONDCOLOR_LAYOUT_MODE=auto       # 'publaynet' / 'opencv' / 'auto'
+      - MOBILE_SAM_CHECKPOINT=/app/weights/mobile_sam.pt
+      - SAM_VIT_B_CHECKPOINT=/app/weights/sam_vit_b_01ec64.pth
+    volumes:
+      # игнорим веса в git
+      - ./weights:/app/weights
+      # моунтим папку результатами
+      - ./output:/app/output
+    restart: unless-stopped
+
+    # ГПУ поддержка 
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # ─────────────────────────────────────────────────────────────────────
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8001/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s   # для модельки нужно время для старта
+
+  # Optional: nginx reverse proxy
+  # nginx:
+  #   image: nginx:alpine
+  #   ports:
+  #     - "80:80"
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/conf.d/default.conf
+  #   depends_on:
+  #     - beyondcolor
