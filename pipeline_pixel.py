@@ -10,10 +10,9 @@ import fitz
 import numpy as np
 from PIL import Image
 
-from model_loader import load_sam, get_device, DEVICE
+DEVICE = "cpu"
 from layout_detector import get_detector, FigureBlock
-from segmenter import SAMSegmenter, deduplicate_segments, ColoredSegment
-from pattern_renderer import render_patterns_on_segments
+from pixel_segmenter import apply_double_coding
 from contrast_checker import audit_image_contrast
 
 
@@ -58,13 +57,16 @@ class PipelineReport:
     def print_summary(self) -> None:
         print(f"""
 
-BeyondColor Processing Report   
+     BeyondColor Processing Report    
+
   Input:       {self.input_path[:35]:<35} 
   Device:      {self.device:<35} 
   Layout:      {self.layout_mode:<35} 
+
   Pages:       {self.pages_processed:<35} 
   Figures:     {self.figures_found:<35} 
-  Segments:    {self.segments_total:<35} 
+  Segments:    {self.segments_total:<35}
+
   Violations:  {self.violations_detected:<35} 
   Fixed:       {self.violations_fixed:<35} 
   Compliance:  {f'{self.compliance_score:.1f}%':<35} 
@@ -76,7 +78,6 @@ class BeyondColorPipeline:
     def __init__(
         self,
         layout_mode: str = "opencv",
-        sam_points_per_side: int = 32,
         pattern_opacity: int = 100,
         tile_size: int = 14,
         min_figure_area: int = 4000,
@@ -89,10 +90,8 @@ class BeyondColorPipeline:
         self.min_segment_area  = min_segment_area
         self.page_dpi          = page_dpi
 
-        print("[BeyondColor] Initialising pipeline...")
+        print("[BeyondColor] Initialising pipeline (pixel mode)...")
         self._layout_detector = get_detector(force_mode=layout_mode, device=DEVICE)
-        _, self._mask_generator = load_sam(points_per_side=sam_points_per_side)
-        self._segmenter = SAMSegmenter(self._mask_generator)
         self.layout_mode = type(self._layout_detector).__name__
         print("[BeyondColor] Pipeline ready.\n")
 
@@ -236,53 +235,27 @@ class BeyondColorPipeline:
         source: str = "unknown",
     ) -> tuple[Image.Image, list[FigureInfo], int]:
 
-        
-        MIN_SIDE = 600  # увеличен с 400 до 600 для лучшей сегментации pie charts
-        MAX_SIDE = 1200
-        w, h = figure_img.size
-        if max(w, h) < MIN_SIDE:
-            scale = MIN_SIDE / max(w, h)
-            figure_img = figure_img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-            print(f"  [upscale] {w}x{h} → {figure_img.size[0]}x{figure_img.size[1]}")
-        elif max(w, h) > MAX_SIDE:
-            scale = MAX_SIDE / max(w, h)
-            figure_img = figure_img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-            print(f"  [downscale] {w}x{h} → {figure_img.size[0]}x{figure_img.size[1]}")
-
         audit_before = audit_image_contrast(figure_img, sample_count=150)
 
-        raw_segments = self._segmenter.segment(
+        # Pixel double coding - красим каждый пиксель по цвету
+        processed = apply_double_coding(
             figure_img,
-            min_area=self.min_segment_area,
-            is_pie=(source == "piechart"),
+            opacity=self.pattern_opacity,
         )
-        segments = deduplicate_segments(raw_segments, iou_threshold=0.5 if source == "piechart" else 0.7)
-
-        if segments:
-            processed = render_patterns_on_segments(
-                figure_img, segments,
-                pattern_opacity=self.pattern_opacity,
-                tile_size=self.tile_size,
-            )
-        else:
-            processed = figure_img
 
         audit_after = audit_image_contrast(processed, sample_count=150)
 
         fig_info = FigureInfo(
             page=page, bbox=bbox, figure_source=source,
-            segments_found=len(segments),
-            patterns_applied=list({s.pattern for s in segments}),
+            segments_found=1,
+            patterns_applied=["pixel_double_coding"],
             contrast_before=round(audit_before.mean_ratio, 2),
             contrast_after=round(audit_after.mean_ratio, 2),
             violation_before=not audit_before.overall_pass,
             violation_after=not audit_after.overall_pass,
-            segments=[
-                SegmentInfo(color=s.color_name, pattern=s.pattern, area_px=s.area, iou=round(s.predicted_iou, 3))
-                for s in segments[:20]
-            ],
+            segments=[],
         )
-        return processed, [fig_info], len(segments)
+        return processed, [fig_info], 1
 
 
 _default_pipeline: BeyondColorPipeline | None = None
@@ -325,4 +298,4 @@ if __name__ == "__main__":
         report.print_summary()
     else:
         print("Unsupported file type.")
-        sys.exit(1)     
+        sys.exit(1)
