@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
+import cv2
 import fitz
 import numpy as np
 from PIL import Image
@@ -71,6 +72,68 @@ BeyondColor Processing Report
   Time:        {f'{self.processing_time_ms}ms':<35} 
 """)
 
+def build_text_protection_mask(image: Image.Image) -> np.ndarray:
+    """
+    Возвращает бинарную маску контрастных мелких элементов:
+    текста, цифр и подписей.
+
+    255 — пиксель нужно защитить;
+    0 — паттерн можно наносить.
+    """
+    rgb = np.array(image.convert("RGB"))
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+    # Тёмный текст на светлом фоне
+    blackhat_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (15, 5)
+    )
+    blackhat = cv2.morphologyEx(
+        gray,
+        cv2.MORPH_BLACKHAT,
+        blackhat_kernel,
+    )
+
+    # Светлый текст на тёмном или цветном фоне
+    tophat_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (15, 5)
+    )
+    tophat = cv2.morphologyEx(
+        gray,
+        cv2.MORPH_TOPHAT,
+        tophat_kernel,
+    )
+
+    response = cv2.max(blackhat, tophat)
+
+    _, mask = cv2.threshold(
+        response,
+        18,
+        255,
+        cv2.THRESH_BINARY,
+    )
+
+    # Соединяем пиксели внутри букв
+    close_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (3, 3)
+    )
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        close_kernel,
+        iterations=1,
+    )
+
+    # Создаём небольшой защитный отступ вокруг букв
+    dilate_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (5, 5)
+    )
+    mask = cv2.dilate(
+        mask,
+        dilate_kernel,
+        iterations=1,
+    )
+
+    return mask
 
 class BeyondColorPipeline:
     def __init__(
@@ -229,48 +292,85 @@ class BeyondColorPipeline:
         return reports
 
     def _process_figure(
-        self,
-        figure_img: Image.Image,
-        page: int = 1,
-        bbox: tuple = (0, 0, 0, 0),
-        source: str = "unknown",
+            self,
+            figure_img: Image.Image,
+            page: int = 1,
+            bbox: tuple = (0, 0, 0, 0),
+            source: str = "unknown",
     ) -> tuple[Image.Image, list[FigureInfo], int]:
 
-        
-        MIN_SIDE = 600  # увеличен с 400 до 600 для лучшей сегментации pie charts
+        MIN_SIDE = 600
         MAX_SIDE = 1200
+
         w, h = figure_img.size
+
         if max(w, h) < MIN_SIDE:
             scale = MIN_SIDE / max(w, h)
-            figure_img = figure_img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            figure_img = figure_img.resize(
+                (int(w * scale), int(h * scale)),
+                Image.LANCZOS,
+            )
             print(f"  [upscale] {w}x{h} → {figure_img.size[0]}x{figure_img.size[1]}")
+
         elif max(w, h) > MAX_SIDE:
             scale = MAX_SIDE / max(w, h)
-            figure_img = figure_img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            figure_img = figure_img.resize(
+                (int(w * scale), int(h * scale)),
+                Image.LANCZOS,
+            )
             print(f"  [downscale] {w}x{h} → {figure_img.size[0]}x{figure_img.size[1]}")
 
-        audit_before = audit_image_contrast(figure_img, sample_count=150)
+        # Сохраняем оригинал после resize.
+        original_figure = figure_img.copy()
+
+        # Строим маску текста и других мелких контрастных деталей.
+        protection_mask = build_text_protection_mask(original_figure)
+
+        audit_before = audit_image_contrast(
+            figure_img,
+            sample_count=150,
+        )
 
         raw_segments = self._segmenter.segment(
             figure_img,
             min_area=self.min_segment_area,
             is_pie=(source == "piechart"),
         )
-        segments = deduplicate_segments(raw_segments, iou_threshold=0.5 if source == "piechart" else 0.7)
+
+        segments = deduplicate_segments(
+            raw_segments,
+            iou_threshold=0.5 if source == "piechart" else 0.7,
+        )
 
         if segments:
             processed = render_patterns_on_segments(
-                figure_img, segments,
+                figure_img,
+                segments,
                 pattern_opacity=self.pattern_opacity,
                 tile_size=self.tile_size,
             )
+
+            # Возвращаем оригинальные пиксели в защищённых областях.
+            processed_arr = np.array(processed.convert("RGB"))
+            original_arr = np.array(original_figure.convert("RGB"))
+
+            protected = protection_mask > 0
+            processed_arr[protected] = original_arr[protected]
+
+            processed = Image.fromarray(processed_arr)
+
         else:
             processed = figure_img
 
-        audit_after = audit_image_contrast(processed, sample_count=150)
+        audit_after = audit_image_contrast(
+            processed,
+            sample_count=150,
+        )
 
         fig_info = FigureInfo(
-            page=page, bbox=bbox, figure_source=source,
+            page=page,
+            bbox=bbox,
+            figure_source=source,
             segments_found=len(segments),
             patterns_applied=list({s.pattern for s in segments}),
             contrast_before=round(audit_before.mean_ratio, 2),
@@ -278,10 +378,16 @@ class BeyondColorPipeline:
             violation_before=not audit_before.overall_pass,
             violation_after=not audit_after.overall_pass,
             segments=[
-                SegmentInfo(color=s.color_name, pattern=s.pattern, area_px=s.area, iou=round(s.predicted_iou, 3))
+                SegmentInfo(
+                    color=s.color_name,
+                    pattern=s.pattern,
+                    area_px=s.area,
+                    iou=round(s.predicted_iou, 3),
+                )
                 for s in segments[:20]
             ],
         )
+
         return processed, [fig_info], len(segments)
 
 

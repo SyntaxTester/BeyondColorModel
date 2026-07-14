@@ -208,9 +208,18 @@ class PieChartDetector:
         lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=50,
                                 minLineLength=min(h, w)//3, maxLineGap=10)
         if lines is not None:
-            h_lines = sum(1 for l in lines if abs(l[0][1] - l[0][3]) < 5)
-            v_lines = sum(1 for l in lines if abs(l[0][0] - l[0][2]) < 5)
-            
+            lines = np.asarray(lines).reshape(-1, 4)
+
+            h_lines = sum(
+                1 for x1, y1, x2, y2 in lines
+                if abs(y1 - y2) < 5
+            )
+
+            v_lines = sum(
+                1 for x1, y1, x2, y2 in lines
+                if abs(x1 - x2) < 5
+            )
+
             if h_lines >= 3 and v_lines >= 3:
                 return []
 
