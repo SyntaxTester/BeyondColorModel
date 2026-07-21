@@ -167,12 +167,40 @@ def _find_legend_squares_opencv(
         pattern, pat_color = COLOR_TO_PATTERN.get(dominant, ("diagonal_stripes", (120, 120, 120)))
         # Координаты в полном изображении
         full_x, full_y = x + x_offset, y + y_offset
-        full_mask = np.zeros((arr.shape[0], arr.shape[1]), dtype=bool)
-        full_mask[full_y:full_y+h, full_x:full_x+w] = True
+
+        # Маска только реальной цветной области маркера,
+        # а не всего прямоугольного bounding box.
+        local_mask = np.zeros(search_region.shape[:2], dtype=np.uint8)
+        cv2.drawContours(local_mask, [cnt], -1, 255, thickness=-1)
+
+        # Сохраняем внешнюю рамку легенды.
+        inner_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        local_mask = cv2.erode(local_mask, inner_kernel, iterations=1)
+
+        full_mask = np.zeros(
+            (arr.shape[0], arr.shape[1]),
+            dtype=bool,
+        )
+
+        full_mask[
+            y_offset:y_offset + search_region.shape[0],
+            x_offset:x_offset + search_region.shape[1],
+        ] = local_mask.astype(bool)
+
+        actual_area = int(full_mask.sum())
+
+        if actual_area == 0:
+            continue
+
         found.append(ColoredSegment(
-            mask=full_mask, color_name=dominant, pattern=pattern,
-            pattern_color=pat_color, mean_rgb=tuple(int(v) for v in mean_rgb),
-            area=bbox_area, predicted_iou=1.0, stability_score=1.0,
+            mask=full_mask,
+            color_name=dominant,
+            pattern=pattern,
+            pattern_color=pat_color,
+            mean_rgb=tuple(int(v) for v in mean_rgb),
+            area=actual_area,
+            predicted_iou=1.0,
+            stability_score=1.0,
         ))
     return found
 
@@ -423,12 +451,38 @@ class SAMSegmenter:
             area  = int(mask.sum())
             bbox  = raw["bbox"]
 
-            if area > total_pixels * max_area_ratio: continue
-            if area < 50: continue
+            if area > total_pixels * max_area_ratio:
+                continue
 
-            aspect = bbox[2] / bbox[3] if bbox[3] > 0 else 0
-            is_legend_square = (50 <= area < min_area and 0.4 < aspect < 2.5)
-            if not is_legend_square and area < min_area: continue
+            bw, bh = bbox[2], bbox[3]
+            if bw <= 0 or bh <= 0:
+                continue
+
+            aspect = bw / bh
+
+            # Для круговой диаграммы мелкие элементы внутри круга почти всегда
+            # являются текстом, цифрами или фрагментами границ.
+            if is_pie:
+                min_allowed_area = max(min_area, int(total_pixels * 0.008))
+
+                if area < min_allowed_area:
+                    continue
+
+                if bw < 25 or bh < 25:
+                    continue
+
+            else:
+                # Для обычных графиков сохраняем возможность находить
+                # маленькие квадраты легенды.
+                is_legend_square = (
+                        50 <= area < min_area
+                        and 0.4 < aspect < 2.5
+                        and bw <= 40
+                        and bh <= 40
+                )
+
+                if not is_legend_square and area < min_area:
+                    continue
 
             if _is_text_like(mask, bbox, area, arr):
                 if area > 3000:
