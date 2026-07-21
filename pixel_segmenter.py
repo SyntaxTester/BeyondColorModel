@@ -1,6 +1,7 @@
 from __future__ import annotations
 import numpy as np
 from PIL import Image
+from collections import defaultdict
 
 
 _N_SECTORS = 16
@@ -12,7 +13,6 @@ _PATTERN_FAMILIES = ["lines", "dots", "grid", "dashed", "waves", "zigzag", "cros
 
 
 def _smooth_shadows(arr_rgb: np.ndarray) -> np.ndarray:
-    
     import cv2
     median = cv2.medianBlur(arr_rgb, 5)
     return cv2.bilateralFilter(median, d=15, sigmaColor=80, sigmaSpace=80)
@@ -32,10 +32,498 @@ def _get_present_sectors(hue_smooth: np.ndarray, valid: np.ndarray) -> set[int]:
 
 
 def _assign_pattern_families(present_sectors: set[int]) -> dict[int, str]:
-
     n_families = len(_PATTERN_FAMILIES)
     sectors_sorted = sorted(present_sectors)
     return {s: _PATTERN_FAMILIES[i % n_families] for i, s in enumerate(sectors_sorted)}
+
+
+_MARKER_SHAPES = ["circle", "square", "triangle", "diamond", "cross", "star"]
+
+_CVD_MATRICES = {
+    "deuteranopia": np.array([[0.367322, 0.860646, -0.227968],
+                              [0.280085, 0.672501, 0.047413],
+                              [-0.011820, 0.042940, 0.968881]]),
+    "protanopia":   np.array([[0.152286, 1.052583, -0.204868],
+                              [0.114503, 0.786281, 0.099216],
+                              [-0.003882, -0.048116, 1.051998]]),
+    "tritanopia":   np.array([[1.255528, -0.076749, -0.178779],
+                              [-0.078411, 0.930809, 0.147602],
+                              [0.004733, 0.691367, 0.303900]]),
+}
+_CONFUSABLE_DE = 15.0
+
+
+def _srgb_to_linear(c):
+    c = np.asarray(c, dtype=np.float64) / 255.0
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+
+
+def _to_lab(rgb):
+    lin = _srgb_to_linear(rgb)
+    M = np.array([[0.4124, 0.3576, 0.1805],
+                  [0.2126, 0.7152, 0.0722],
+                  [0.0193, 0.1192, 0.9505]])
+    xyz = lin @ M.T
+    t = xyz / np.array([0.95047, 1.0, 1.08883])
+    f = np.where(t > 0.008856, np.cbrt(t), 7.787 * t + 16 / 116)
+    return np.array([116 * f[1] - 16, 500 * (f[0] - f[1]), 200 * (f[1] - f[2])])
+
+
+def _simulate_cvd(rgb, kind):
+    lin = _srgb_to_linear(rgb) @ _CVD_MATRICES[kind].T
+    lin = np.clip(lin, 0, 1)
+    srgb = np.where(lin <= 0.0031308, lin * 12.92,
+                    1.055 * lin ** (1 / 2.4) - 0.055) * 255
+    return srgb
+
+
+def _confusable_pairs(colors) -> set:
+    bad = set()
+    for i in range(len(colors)):
+        for j in range(i + 1, len(colors)):
+            for kind in _CVD_MATRICES:
+                a = _to_lab(_simulate_cvd(colors[i][:3], kind))
+                b = _to_lab(_simulate_cvd(colors[j][:3], kind))
+                if float(np.linalg.norm(a - b)) < _CONFUSABLE_DE:
+                    bad.add((i, j))
+                    break
+    return bad
+
+
+def _draw_marker(canvas: np.ndarray, cx: int, cy: int, shape: str,
+                 size: int, color: tuple, outline: tuple | None = None) -> None:
+    import cv2
+    r = size // 2
+    c = tuple(int(v) for v in color)
+    if outline is not None:
+        _draw_marker(canvas, cx, cy, shape, size + 3, outline, None)
+
+    if shape == "circle":
+        cv2.circle(canvas, (cx, cy), r, c, -1)
+    elif shape == "square":
+        cv2.rectangle(canvas, (cx - r, cy - r), (cx + r, cy + r), c, -1)
+    elif shape == "triangle":
+        pts = np.array([[cx, cy - r], [cx - r, cy + r], [cx + r, cy + r]], np.int32)
+        cv2.fillPoly(canvas, [pts], c)
+    elif shape == "diamond":
+        pts = np.array([[cx, cy - r], [cx + r, cy], [cx, cy + r], [cx - r, cy]], np.int32)
+        cv2.fillPoly(canvas, [pts], c)
+    elif shape == "cross":
+        t = max(1, r // 2)
+        cv2.rectangle(canvas, (cx - r, cy - t), (cx + r, cy + t), c, -1)
+        cv2.rectangle(canvas, (cx - t, cy - r), (cx + t, cy + r), c, -1)
+    elif shape == "star":
+        cv2.circle(canvas, (cx, cy), r, c, -1)
+        t = max(1, r // 3)
+        cv2.rectangle(canvas, (cx - r - 1, cy - t), (cx + r + 1, cy + t), c, -1)
+
+
+def _cluster_line_colors(arr: np.ndarray, lines_mask: np.ndarray,
+                         max_k: int = 8, min_share: float = 0.04) -> list:
+    import cv2
+
+    px = arr[lines_mask].astype(np.float32)
+    if len(px) < 50:
+        return []
+
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.5)
+    _, labels, centers = cv2.kmeans(px, max_k, None, crit, 10, cv2.KMEANS_PP_CENTERS)
+
+    counts = np.bincount(labels.flatten(), minlength=max_k)
+    total = counts.sum()
+
+    MIN_BLOB = 60
+    COLOR_RADIUS = 45.0
+
+    keep = []
+    for i in range(max_k):
+        if counts[i] / total < min_share:
+            continue
+
+        c = centers[i]
+        dist = np.linalg.norm(arr.astype(np.float32) - c, axis=2)
+        color_mask = lines_mask & (dist < COLOR_RADIUS)
+        if color_mask.sum() < 50:
+            continue
+
+        n_cc, _, st_cc, _ = cv2.connectedComponentsWithStats(color_mask.astype(np.uint8))
+        largest = max((st_cc[j, cv2.CC_STAT_AREA] for j in range(1, n_cc)), default=0)
+        if largest < MIN_BLOB:
+            continue
+
+        keep.append((counts[i], c))
+
+    keep.sort(key=lambda t: -t[0])
+    return [c for _, c in keep]
+
+
+def _background_color(arr: np.ndarray) -> tuple:
+    edges = np.concatenate([arr[0], arr[-1], arr[:, 0], arr[:, -1]])
+    vals, counts = np.unique(edges.reshape(-1, 3), axis=0, return_counts=True)
+    return tuple(int(v) for v in vals[counts.argmax()])
+
+
+def _is_ink(c, bg=(255, 255, 255)) -> bool:
+    return max(abs(int(c[i]) - int(bg[i])) for i in range(3)) > 30
+
+
+def _scan_runs(arr: np.ndarray, minlen: int, maxlen: int, tol: int,
+               bg=(255, 255, 255)) -> list:
+    h, w, _ = arr.shape
+    runs = []
+    for y in range(h):
+        row = arr[y]
+        x = 0
+        while x < w:
+            c = row[x]
+            x0 = x
+            while x < w and np.abs(row[x] - c).max() <= tol:
+                x += 1
+            L = x - x0
+            if minlen <= L <= maxlen:
+                ct = tuple(int(v) for v in c)
+                if _is_ink(ct, bg):
+                    runs.append((y, x0, L, ct))
+            if x == x0:
+                x += 1
+    return runs
+
+
+def _stack_runs(runs: list, maxh: int) -> list:
+    by = defaultdict(list)
+    for y, x0, L, c in runs:
+        by[(x0, L, c)].append(y)
+    out = []
+    for (x0, L, c), ys in by.items():
+        ys = sorted(ys)
+        run = [ys[0]]
+        for a, b in zip(ys, ys[1:]):
+            if b - a <= 1:
+                run.append(b)
+            else:
+                out.append(dict(x=x0, len=L, h=len(run), y=int(np.mean(run)), rgb=c))
+                run = [b]
+        out.append(dict(x=x0, len=L, h=len(run), y=int(np.mean(run)), rgb=c))
+    return [e for e in out if e["h"] <= maxh]
+
+
+def _distinct(colors, thr=30):
+    keep = []
+    for c in colors:
+        if all(max(abs(c[i] - k[i]) for i in range(3)) > thr for k in keep):
+            keep.append(c)
+    return keep
+
+
+def find_legend_handles(arr: np.ndarray,
+                        minlen: int = 8, maxlen: int = 60,
+                        tol: int = 12, maxh: int = 12,
+                        min_series: int = 3) -> list:
+    arr = np.asarray(arr, dtype=np.int32)
+    bg = _background_color(arr)
+    H = _stack_runs(_scan_runs(arr, minlen, maxlen, tol, bg), maxh)
+    if not H:
+        return []
+
+    groups = defaultdict(list)
+    for e in H:
+        for dl in (-1, 0, 1):
+            groups[(e["len"] + dl, e["h"])].append(e)
+    for k in groups:
+        seen, uniq = set(), []
+        for e in groups[k]:
+            sig = (e["x"], e["y"], e["len"], e["rgb"])
+            if sig not in seen:
+                seen.add(sig); uniq.append(e)
+        groups[k] = uniq
+
+    best = None
+    for (L, hh), v in groups.items():
+        cols = _distinct({e["rgb"] for e in v})
+        if len(cols) < min_series:
+            continue
+        ys = [e["y"] for e in v]
+        xs = [e["x"] for e in v]
+        is_row = (max(ys) - min(ys)) <= 3
+        is_col = len(set(xs)) <= 2 and len(set(ys)) >= min_series
+        if not (is_row or is_col):
+            continue
+        seen, uniq = [], []
+        for e in sorted(v, key=lambda e: (e["y"], e["x"])):
+            if all(max(abs(e["rgb"][i] - s[i]) for i in range(3)) > 30 for s in seen):
+                seen.append(e["rgb"])
+                uniq.append(e)
+        if best is None or len(uniq) > len(best):
+            best = uniq
+    return best or []
+
+
+def _on_own_line(arr: np.ndarray, x: int, y: int, centers: np.ndarray,
+                 ci: int, tol: float) -> bool:
+    h, w = arr.shape[:2]
+    if not (0 <= y < h and 0 <= x < w):
+        return False
+    px = arr[y, x].astype(np.float32)
+    d = np.linalg.norm(centers - px, axis=1)
+    if int(d.argmin()) != ci:
+        return False
+    return float(d[ci]) < tol
+
+
+def _collides(occupied: np.ndarray, cx: int, cy: int, size: int) -> bool:
+    h, w = occupied.shape
+    r = size // 2 + 2
+    y1, y2 = max(0, cy - r), min(h, cy + r + 1)
+    x1, x2 = max(0, cx - r), min(w, cx + r + 1)
+    return bool(occupied[y1:y2, x1:x2].any())
+
+
+def _mark_occupied(occupied: np.ndarray, cx: int, cy: int, size: int) -> None:
+    h, w = occupied.shape
+    r = size // 2 + 2
+    occupied[max(0, cy - r):min(h, cy + r + 1),
+             max(0, cx - r):min(w, cx + r + 1)] = True
+
+
+def _marker_colors(series_rgb: np.ndarray) -> tuple:
+    r, g, b = [float(v) for v in series_rgb[:3]]
+    lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    fill = (int(r), int(g), int(b))
+    outline = (255, 255, 255) if lum < 90 else (0, 0, 0)
+    return fill, outline
+
+
+def _place_markers_on_lines(
+    result: np.ndarray,
+    lines_mask: np.ndarray,
+    arr: np.ndarray,
+    marker_size: int = 9,
+    step: int = 60,
+    legend_handles: list | None = None,
+) -> np.ndarray:
+    import cv2
+
+    handles = legend_handles if legend_handles else []
+    if handles:
+        line_colors = [np.array(h["rgb"], dtype=np.float32) for h in handles]
+    else:
+        line_colors = _cluster_line_colors(arr, lines_mask)
+    if not line_colors:
+        return result
+
+    ys, xs = np.where(lines_mask)
+    if len(ys) == 0:
+        return result
+
+    occupied = np.zeros(lines_mask.shape, dtype=bool)
+
+    pixels = arr[ys, xs].astype(np.float32)
+
+    centers = np.array(line_colors, dtype=np.float32)
+    dists = np.linalg.norm(pixels[:, None, :] - centers[None, :, :], axis=2)
+    assign = dists.argmin(axis=1)
+    best_dist = dists.min(axis=1)
+
+    if len(centers) > 1:
+        pair = [float(np.linalg.norm(centers[i] - centers[j]))
+                for i in range(len(centers)) for j in range(i + 1, len(centers))]
+        own_tol = min(60.0, min(pair) * 0.5)
+    else:
+        own_tol = 60.0
+    MAX_COLOR_DIST = own_tol
+    on_line = best_dist < MAX_COLOR_DIST
+
+    series_mask = []
+    for ci in range(len(line_colors)):
+        m = np.zeros(lines_mask.shape, dtype=bool)
+        sel_i = (assign == ci) & on_line
+        m[ys[sel_i], xs[sel_i]] = True
+        series_mask.append(m)
+
+    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    dil = [cv2.dilate(m.astype(np.uint8), kern).astype(bool) for m in series_mask]
+    risky = _confusable_pairs([tuple(int(v) for v in c) for c in centers])
+
+    crossings = []
+    for i in range(len(series_mask)):
+        for j in range(i + 1, len(series_mask)):
+            if (i, j) not in risky:
+                continue
+            both = dil[i] & dil[j] & (series_mask[i] | series_mask[j])
+            n_cc, _, st_cc, cen_cc = cv2.connectedComponentsWithStats(
+                both.astype(np.uint8), 8)
+            for q in range(1, n_cc):
+                if st_cc[q, cv2.CC_STAT_AREA] >= 12:
+                    crossings.append((int(cen_cc[q][0]), int(cen_cc[q][1]), i, j))
+
+    offset = marker_size + 4
+    keep_out = marker_size
+
+    def _on_crossing(cx, cy):
+        return any(abs(cx - qx) < keep_out and abs(cy - qy) < keep_out
+                   for qx, qy, _, _ in crossings)
+
+    foreign_px = []
+    for ci_ in range(len(centers)):
+        m = (np.abs(arr.astype(np.int32) - centers[ci_].astype(np.int32)
+                    ).max(2) < 30)
+        foreign_px.append(m)
+
+    def _covers_foreign(ci, cx, cy, size, limit=6):
+        r = size // 2
+        y1, y2 = max(0, cy - r), min(foreign_px[0].shape[0], cy + r + 1)
+        x1, x2 = max(0, cx - r), min(foreign_px[0].shape[1], cx + r + 1)
+        foreign = sum(int(foreign_px[si][y1:y2, x1:x2].sum())
+                      for si in range(len(foreign_px)) if si != ci)
+        own = int(foreign_px[ci][y1:y2, x1:x2].sum())
+        return foreign > own
+
+    for ci, h in enumerate(handles):
+        shape = _MARKER_SHAPES[ci % len(_MARKER_SHAPES)]
+        fill, outline = _marker_colors(np.array(h["rgb"], dtype=np.float32))
+        cx = h["x"] + h["len"] // 2
+        _draw_marker(result, cx, h["y"], shape, marker_size + 2, fill, outline)
+        _mark_occupied(occupied, cx, h["y"], marker_size + 2)
+
+    for ci in range(len(line_colors)):
+        sel = (assign == ci) & on_line
+        if sel.sum() < 50:
+            continue
+        shape = _MARKER_SHAPES[ci % len(_MARKER_SHAPES)]
+        fill, outline = _marker_colors(centers[ci])
+
+        cx_all = xs[sel]
+        cy_all = ys[sel]
+
+        x_min, x_max = int(cx_all.min()), int(cx_all.max())
+
+        cross_x = []
+        for qx, qy, a, b in crossings:
+            if ci in (a, b):
+                cross_x.append(qx - offset)
+                cross_x.append(qx + offset)
+        cross_x.sort()
+
+        anchors = list(range(x_min, x_max + 1, step))
+
+        cap = len(anchors) * 2
+        if len(cross_x) > cap:
+            idx = np.linspace(0, len(cross_x) - 1, cap).astype(int)
+            cross_x = [cross_x[i] for i in sorted(set(idx))]
+
+        plan = [(0, x) for x in cross_x]
+        plan.extend((1, x) for x in anchors)
+        plan.sort()
+
+        budget = len(anchors) * 2
+        used = 0
+
+        for prio, x_target in plan:
+            if used >= budget:
+                break
+            if not (x_min <= x_target <= x_max):
+                continue
+            near = np.abs(cx_all - x_target) <= 2
+            if not near.any():
+                continue
+
+            cand = np.unique(cy_all[near])
+            y_med = float(np.median(cy_all[near]))
+
+            y_here = None
+            for y in sorted(cand, key=lambda y: abs(y - y_med)):
+                if _on_crossing(x_target, int(y)):
+                    continue
+                if _covers_foreign(ci, x_target, int(y), marker_size):
+                    continue
+                if _on_own_line(arr, x_target, int(y), centers, ci, own_tol):
+                    if not _collides(occupied, x_target, int(y), marker_size):
+                        y_here = int(y)
+                        break
+            if y_here is None:
+                continue
+
+            _mark_occupied(occupied, x_target, y_here, marker_size)
+            _draw_marker(result, x_target, y_here, shape, marker_size,
+                         fill, outline)
+            used += 1
+
+    return result
+
+
+def _is_line_chart(valid: np.ndarray, thin: np.ndarray, min_area: int = 150) -> bool:
+    import cv2
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(valid.astype(np.uint8))
+    thick_area = 0
+    thin_area = 0
+    for i in range(1, n):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area < min_area:
+            continue
+        comp = (labels == i)
+        if (comp & thin).sum() > area * 0.5:
+            thin_area += area
+        else:
+            thick_area += area
+
+    total = thick_area + thin_area
+    if total == 0:
+        return False
+    return (thin_area / total) > 0.05
+
+
+def _find_legend_squares(valid: np.ndarray) -> np.ndarray:
+    import cv2
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(valid.astype(np.uint8))
+    squares = np.zeros_like(valid, dtype=bool)
+
+    for i in range(1, n):
+        cw = stats[i, cv2.CC_STAT_WIDTH]
+        ch = stats[i, cv2.CC_STAT_HEIGHT]
+        area = stats[i, cv2.CC_STAT_AREA]
+        if not (4 <= cw <= 14 and 4 <= ch <= 14):
+            continue
+        if area < 12:
+            continue
+        aspect = cw / ch if ch > 0 else 0
+        if not (0.8 <= aspect <= 1.25):
+            continue
+        fill = area / (cw * ch) if (cw * ch) > 0 else 0
+        if fill < 0.75:
+            continue
+        squares |= (labels == i)
+
+    return squares
+
+
+def _find_thin_structures(valid: np.ndarray, erode_px: int = 2) -> np.ndarray:
+    import cv2
+
+    k_size = erode_px * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(valid.astype(np.uint8))
+    thin = np.zeros_like(valid, dtype=bool)
+
+    SURVIVE_THRESHOLD = 0.55
+
+    for i in range(1, n):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area < 20:
+            continue
+        comp = (labels == i).astype(np.uint8)
+        survived = int(cv2.erode(comp, kernel).sum())
+        if survived / area < SURVIVE_THRESHOLD:
+            thin |= (labels == i)
+
+    return thin
+
+
+def _adaptive_spacing(h_img: int, w_img: int) -> float:
+    ref = max(h_img, w_img)
+    return max(8.0, min(ref / 100.0, 40.0))
 
 
 def _draw_pattern(
@@ -120,7 +608,8 @@ def _procedural_pattern_mask(
             continue
         angle_rad = np.deg2rad(_ANGLE_LUT[s])
         family = family_map.get(s, "lines")
-        pattern = _draw_pattern(family, xx, yy, angle_rad, bold)
+        pattern = _draw_pattern(family, xx, yy, angle_rad, bold,
+                                spacing=_adaptive_spacing(h_img, w_img))
         result |= (sector_mask & pattern)
 
     return result
@@ -132,7 +621,6 @@ def _redraw_small_elements(
     result: np.ndarray, alpha: float,
     family_map: dict, sector_rgb: dict,
 ) -> np.ndarray:
-
     import cv2
 
     h_img, w_img = arr.shape[:2]
@@ -153,8 +641,12 @@ def _redraw_small_elements(
             continue
         if area < 12:
             continue
+
         aspect = cw / ch if ch > 0 else 0
-        if not (0.5 < aspect < 2.0):
+        if not (0.8 <= aspect <= 1.25):
+            continue
+        fill = area / (cw * ch) if (cw * ch) > 0 else 0
+        if fill < 0.75:
             continue
 
         elem_mask = (labels == i)
@@ -190,7 +682,8 @@ def _redraw_small_elements(
         is_bold = (rep_hsv[1] / 255.0) > 0.5
         bold = np.full((h_img, w_img), is_bold, dtype=bool)
 
-        pattern = _draw_pattern(family, xx, yy, angle_rad, bold, spacing=6.0)
+        pattern = _draw_pattern(family, xx, yy, angle_rad, bold,
+                                spacing=MARKER / 3.0)
         block = np.zeros((h_img, w_img), dtype=bool)
         block[y0:y1, x0:x1] = True
         draw_here = block & pattern
@@ -228,7 +721,7 @@ def _procedural_pattern_mask_with_families(
         n_c, lab_c, st_c, _ = cv2.connectedComponentsWithStats(comp_u8)
         big_pixels = []
         for c in range(1, n_c):
-            if st_c[c, cv2.CC_STAT_AREA] >= 300:  # крупная область = данные
+            if st_c[c, cv2.CC_STAT_AREA] >= 300:
                 big_pixels.append(lab_c == c)
         if big_pixels:
             big_mask_s = np.any(big_pixels, axis=0)
@@ -240,7 +733,8 @@ def _procedural_pattern_mask_with_families(
             continue
         angle_rad = np.deg2rad(_ANGLE_LUT[s])
         family = family_map.get(s, "lines")
-        pattern = _draw_pattern(family, xx, yy, angle_rad, bold)
+        pattern = _draw_pattern(family, xx, yy, angle_rad, bold,
+                                spacing=_adaptive_spacing(h_img, w_img))
         result |= (sector_mask & pattern)
 
     return result, present, family_map, sector_rgb
@@ -250,6 +744,7 @@ def apply_double_coding(
     image: Image.Image,
     opacity: int = 100,
     smooth_shadows: bool = True,
+    exclude_text: bool = True,
 ) -> Image.Image:
     import cv2
 
@@ -273,6 +768,25 @@ def apply_double_coding(
         (sat >= 0.12)
     )
 
+    line_chart = False
+    lines_for_markers = None
+    if exclude_text:
+        thin = _find_thin_structures(valid)
+        legend = _find_legend_squares(valid)
+        line_chart = _is_line_chart(valid, thin)
+
+        if line_chart:
+            import cv2
+            n_c, lab_c, st_c, _ = cv2.connectedComponentsWithStats(thin.astype(np.uint8))
+            big_thin = np.zeros_like(thin)
+            for i in range(1, n_c):
+                if st_c[i, cv2.CC_STAT_AREA] >= 150:
+                    big_thin |= (lab_c == i)
+            lines_for_markers = big_thin
+            valid = valid & ~(thin & ~legend)
+        else:
+            valid = valid & ~(thin & ~legend)
+
     hue_scaled_light = (hue / 360.0 * 255.0).astype(np.uint8)
     hue_legend = cv2.medianBlur(hue_scaled_light, 3).astype(np.float32) / 255.0 * 360.0
 
@@ -288,5 +802,13 @@ def apply_double_coding(
     result = _redraw_small_elements(
         arr, valid, result, alpha, family_map, sector_rgb
     )
+
+    if line_chart and lines_for_markers is not None:
+        result_u8 = result.astype(np.uint8)
+        result_u8 = _place_markers_on_lines(
+            result_u8, lines_for_markers, arr,
+            legend_handles=find_legend_handles(arr),
+        )
+        result = result_u8.astype(np.float32)
 
     return Image.fromarray(result.astype(np.uint8))

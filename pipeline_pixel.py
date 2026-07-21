@@ -65,13 +65,12 @@ class PipelineReport:
 
   Pages:       {self.pages_processed:<35} 
   Figures:     {self.figures_found:<35} 
-  Segments:    {self.segments_total:<35}
+  Segments:    {self.segments_total:<35} 
 
   Violations:  {self.violations_detected:<35} 
   Fixed:       {self.violations_fixed:<35} 
   Compliance:  {f'{self.compliance_score:.1f}%':<35} 
-  Time:        {f'{self.processing_time_ms}ms':<35} 
-""")
+  Time:        {f'{self.processing_time_ms}ms':<35}""")
 
 
 class BeyondColorPipeline:
@@ -113,6 +112,10 @@ class BeyondColorPipeline:
             ]
             if len(blocks) > 3:
                 blocks = blocks[:1]
+
+        if not blocks:
+            w_img, h_img = img.size
+            blocks = [FigureBlock(0, 0, w_img, h_img, 1.0, "wholeimage")]
 
         final_img = img.copy()
         all_fig_infos = []
@@ -237,7 +240,6 @@ class BeyondColorPipeline:
 
         audit_before = audit_image_contrast(figure_img, sample_count=150)
 
-        # Pixel double coding - красим каждый пиксель по цвету
         processed = apply_double_coding(
             figure_img,
             opacity=self.pattern_opacity,
@@ -276,6 +278,17 @@ def process_bulk(input_paths: list[str], output_dir: str, **kwargs) -> list[Pipe
     return _get_pipeline(**kwargs).process_bulk(input_paths, output_dir)
 
 
+def _supported_image_extensions() -> set[str]:
+    
+    from PIL import Image
+
+    Image.init()
+    exts = set(Image.registered_extensions().keys())
+
+    exts -= {".pdf"}
+    return exts
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 3:
@@ -293,9 +306,11 @@ if __name__ == "__main__":
     elif inp.suffix.lower() == ".pdf":
         report = process_pdf(str(inp), str(out))
         out.with_suffix(".report.json").write_text(json.dumps(report.to_dict(), indent=2, default=str))
-    elif inp.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+    elif inp.suffix.lower() in _supported_image_extensions():
         report = process_image(str(inp), str(out))
         report.print_summary()
     else:
-        print("Unsupported file type.")
+        supported = ", ".join(sorted(_supported_image_extensions()))
+        print(f"Unsupported file type: {inp.suffix}")
+        print(f"Supported: .pdf, {supported}")
         sys.exit(1)
