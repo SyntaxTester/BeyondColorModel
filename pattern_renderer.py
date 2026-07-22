@@ -98,11 +98,43 @@ def _get_tile_size(seg: ColoredSegment, default_tile_size: int) -> int:
     Маленькие объекты (легенда) получают мелкий тайл
     Большие столбцы стандартный
     """
-    area = seg.area
-    if area < 100:      return 3   # квадратики легенды 7x7
-    if area < 500:      return 5   # мелкие объекты
-    if area < 2000:     return 8   # средние
-    return default_tile_size       # крупные столбцы стандартный
+    import cv2
+
+    if seg.area < 500:
+        area_tile = 5
+    elif seg.area < 2000:
+        area_tile = 8
+    else:
+        area_tile = default_tile_size
+
+    distance = cv2.distanceTransform(
+        seg.mask.astype(np.uint8), cv2.DIST_L2, 3
+    )
+    max_thickness = max(2, int(np.ceil(distance.max() * 2)))
+    return max(2, min(area_tile, max_thickness))
+
+
+def _apply_mask_to_alpha(layer: Image.Image, mask: np.ndarray) -> None:
+    """Ограничивает существующую прозрачность паттерна маской сегмента."""
+    pattern_alpha = np.asarray(layer.getchannel("A"), dtype=np.uint16)
+    mask_alpha = mask.astype(np.uint16) * 255
+    alpha = (pattern_alpha * mask_alpha // 255).astype(np.uint8)
+    layer.putalpha(Image.fromarray(alpha, mode="L"))
+
+
+def _relative_luminance(color: tuple) -> float:
+    channels = []
+    for channel in color[:3]:
+        value = channel / 255
+        channels.append(value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def _high_contrast_color(background: tuple) -> tuple[int, int, int]:
+    luminance = _relative_luminance(background)
+    black_contrast = (luminance + 0.05) / 0.05
+    white_contrast = 1.05 / (luminance + 0.05)
+    return (0, 0, 0) if black_contrast >= white_contrast else (255, 255, 255)
 
 
 # рендер
@@ -126,30 +158,35 @@ def render_patterns_on_segments(
         if seg.pattern not in TILE_FACTORIES:
             continue
 
-        # Маленькие объекты легенды (7x7px) увеличенный квадрат с паттерном
-        if seg.area < 200:
-            _draw_legend_marker(result, seg.mask, seg.pattern_color, seg.pattern, pattern_opacity)
+        if seg.is_legend:
+            _draw_legend_marker(
+                result, seg.mask, seg.mean_rgb, seg.pattern, pattern_opacity
+            )
             continue
 
         # Динамический tile_size для столбцов
         adaptive_tile = _get_tile_size(seg, tile_size)
 
+        pattern_color = _high_contrast_color(seg.mean_rgb)
+        effective_opacity = min(255, max(210, pattern_opacity))
         pattern_layer = _make_tiled_pattern(
             w, h,
             seg.pattern,
-            seg.pattern_color,
-            pattern_opacity,
+            pattern_color,
+            effective_opacity,
             adaptive_tile,
         )
 
-        mask_arr = seg.mask.astype(np.uint8) * 255
-        mask_pil = Image.fromarray(mask_arr, mode="L")
-        pattern_layer.putalpha(mask_pil)
+        _apply_mask_to_alpha(pattern_layer, seg.mask)
 
         result = Image.alpha_composite(result, pattern_layer)
 
         if stroke_outline:
-            _draw_segment_outline(result, seg.mask, seg.pattern_color, outline_opacity, 2)
+            outline_width = 1 if adaptive_tile < 6 else 2
+            _draw_segment_outline(
+                result, seg.mask, pattern_color,
+                min(255, max(210, outline_opacity)), outline_width
+            )
 
     return result
 
@@ -157,59 +194,30 @@ def render_patterns_on_segments(
 def _draw_legend_marker(
     image: Image.Image,
     mask: np.ndarray,
-    color: tuple,
+    marker_color: tuple,
     pattern: str,
     pattern_opacity: int = 200,
-    marker_size: int = 16,
 ) -> None:
-    """
-    Для маленьких квадратиков легенды рисуем увеличенный квадрат
-    с тем же паттерном что у столбцов поверх оригинала
-    marker_size=16 гарантирует что паттерн будет читаем
-    """
-    import cv2
+    """Наносит паттерн строго внутри исходного маркера легенды."""
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return
 
-    mask_u8 = mask.astype(np.uint8) * 255
-    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
-
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-
-        # Центр оригинального квадратика
-        cx = x + w // 2
-        cy = y + h // 2
-
-        # Координаты увеличенного квадрата
-        half = marker_size // 2
-        x1, y1 = max(0, cx - half), max(0, cy - half)
-        x2, y2 = min(image.width - 1, cx + half), min(image.height - 1, cy + half)
-
-        # 1. Заливка цветом
-        draw = ImageDraw.Draw(overlay)
-        draw.rectangle([x1, y1, x2, y2], fill=(*color, 255))
-
-        # 2. Паттерн поверх заливки
-        if pattern in TILE_FACTORIES:
-            tile_size = max(4, marker_size // 3)
-            r, g, b = color[:3]
-            luminance = 0.299 * r + 0.587 * g + 0.114 * b
-            pat_color = (0, 0, 0) if luminance > 100 else (255, 255, 255)
-            legend_pattern = "checkerboard" if pattern in ("horizontal_lines", "vertical_lines") else pattern
-
-            # Рисуем паттерн только в области квадратика напрямую
-            pat_tile = TILE_FACTORIES[legend_pattern](tile_size, pat_color, 255)
-            for py in range(y1, y2, pat_tile.height):
-                for px in range(x1, x2, pat_tile.width):
-                    overlay.paste(pat_tile, (px, py), pat_tile)
-
-        # 3. Чёрная рамка
-        draw = ImageDraw.Draw(overlay)
-        draw.rectangle([x1, y1, x2, y2], outline=(0, 0, 0, 255), width=1)
-
-    combined = Image.alpha_composite(image, overlay)
-    image.paste(combined)
+    marker_width = int(xs.max() - xs.min() + 1)
+    marker_height = int(ys.max() - ys.min() + 1)
+    pattern_color = _high_contrast_color(marker_color)
+    tile_size = max(2, min(4, min(marker_width, marker_height) // 2))
+    pattern_layer = _make_tiled_pattern(
+        image.width,
+        image.height,
+        pattern,
+        pattern_color,
+        min(255, max(210, pattern_opacity)),
+        tile_size,
+    )
+    _apply_mask_to_alpha(pattern_layer, mask)
+    image.paste(Image.alpha_composite(image, pattern_layer))
+    _draw_segment_outline(image, mask, pattern_color, 255, width=1)
 
 
 def _draw_segment_outline(

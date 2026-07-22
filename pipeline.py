@@ -11,9 +11,15 @@ import fitz
 import numpy as np
 from PIL import Image
 
+from image_provenance import save_processed_image, validate_image_input
 from model_loader import load_sam, get_device, DEVICE
 from layout_detector import get_detector, FigureBlock
-from segmenter import SAMSegmenter, deduplicate_segments, ColoredSegment
+from segmenter import (
+    SAMSegmenter,
+    assign_patterns_by_series,
+    deduplicate_segments,
+    ColoredSegment,
+)
 from pattern_renderer import render_patterns_on_segments
 from contrast_checker import audit_image_contrast
 
@@ -140,7 +146,7 @@ class BeyondColorPipeline:
         self,
         layout_mode: str = "opencv",
         sam_points_per_side: int = 32,
-        pattern_opacity: int = 100,
+        pattern_opacity: int = 210,
         tile_size: int = 14,
         min_figure_area: int = 4000,
         min_segment_area: int = 80,
@@ -161,7 +167,9 @@ class BeyondColorPipeline:
 
     def process_image(self, input_path: str | Path, output_path: str | Path) -> PipelineReport:
         start_t = time.perf_counter()
-        img = Image.open(input_path).convert("RGB")
+        source_img = Image.open(input_path)
+        validate_image_input(source_img, input_path, output_path)
+        img = source_img.convert("RGB")
 
         blocks = self._layout_detector.detect(img, min_area=self.min_figure_area)
 
@@ -194,7 +202,7 @@ class BeyondColorPipeline:
                 ), (block.x1, block.y1))
             all_fig_infos.extend(fig_info_list)
 
-        final_img.save(output_path)
+        save_processed_image(final_img, output_path)
 
         violations = sum(1 for f in all_fig_infos if f.violation_before)
         fixed      = sum(1 for f in all_fig_infos if f.violation_before and not f.violation_after)
@@ -341,14 +349,19 @@ class BeyondColorPipeline:
             raw_segments,
             iou_threshold=0.5 if source == "piechart" else 0.7,
         )
+        segments = assign_patterns_by_series(segments)
 
         if segments:
-            processed = render_patterns_on_segments(
-                figure_img,
-                segments,
-                pattern_opacity=self.pattern_opacity,
-                tile_size=self.tile_size,
-            )
+            legend_segments = [seg for seg in segments if seg.is_legend]
+            data_segments = [seg for seg in segments if not seg.is_legend]
+            processed = figure_img
+            if data_segments:
+                processed = render_patterns_on_segments(
+                    processed,
+                    data_segments,
+                    pattern_opacity=self.pattern_opacity,
+                    tile_size=self.tile_size,
+                )
 
             # Возвращаем оригинальные пиксели в защищённых областях.
             processed_arr = np.array(processed.convert("RGB"))
@@ -358,6 +371,13 @@ class BeyondColorPipeline:
             processed_arr[protected] = original_arr[protected]
 
             processed = Image.fromarray(processed_arr)
+            if legend_segments:
+                processed = render_patterns_on_segments(
+                    processed,
+                    legend_segments,
+                    pattern_opacity=self.pattern_opacity,
+                    tile_size=self.tile_size,
+                )
 
         else:
             processed = figure_img
@@ -431,4 +451,4 @@ if __name__ == "__main__":
         report.print_summary()
     else:
         print("Unsupported file type.")
-        sys.exit(1)     
+        sys.exit(1)

@@ -165,44 +165,82 @@ def _find_legend_squares_opencv(
         if dominant in excluded_colors:
             continue
         pattern, pat_color = COLOR_TO_PATTERN.get(dominant, ("diagonal_stripes", (120, 120, 120)))
-        # Координаты в полном изображении
-        full_x, full_y = x + x_offset, y + y_offset
+        contour_mask = np.zeros(search_region.shape[:2], dtype=np.uint8)
+        cv2.drawContours(contour_mask, [cnt], -1, 255, thickness=-1)
 
-        # Маска только реальной цветной области маркера,
-        # а не всего прямоугольного bounding box.
-        local_mask = np.zeros(search_region.shape[:2], dtype=np.uint8)
-        cv2.drawContours(local_mask, [cnt], -1, 255, thickness=-1)
-
-        # Сохраняем внешнюю рамку легенды.
-        inner_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        local_mask = cv2.erode(local_mask, inner_kernel, iterations=1)
-
-        full_mask = np.zeros(
-            (arr.shape[0], arr.shape[1]),
-            dtype=bool,
-        )
-
+        full_mask = np.zeros((arr.shape[0], arr.shape[1]), dtype=bool)
         full_mask[
             y_offset:y_offset + search_region.shape[0],
             x_offset:x_offset + search_region.shape[1],
-        ] = local_mask.astype(bool)
-
+        ] = contour_mask.astype(bool)
         actual_area = int(full_mask.sum())
-
         if actual_area == 0:
             continue
 
         found.append(ColoredSegment(
-            mask=full_mask,
-            color_name=dominant,
-            pattern=pattern,
-            pattern_color=pat_color,
-            mean_rgb=tuple(int(v) for v in mean_rgb),
-            area=actual_area,
-            predicted_iou=1.0,
-            stability_score=1.0,
+            mask=full_mask, color_name=dominant, pattern=pattern,
+            pattern_color=pat_color, mean_rgb=tuple(int(v) for v in mean_rgb),
+            area=actual_area, predicted_iou=1.0, stability_score=1.0,
+            is_legend=True,
         ))
     return found
+
+
+def _find_missing_legend_markers_by_column(
+    arr: np.ndarray,
+    existing: list["ColoredSegment"],
+    excluded_colors: set[str],
+) -> list["ColoredSegment"]:
+    import cv2
+
+    h_img, w_img = arr.shape[:2]
+    x_offset = w_img // 2
+    search_region = arr[:, x_offset:, :]
+    hsv = cv2.cvtColor(search_region, cv2.COLOR_RGB2HSV)
+    colored = (hsv[:, :, 1] > 45).astype(np.uint8)
+    labels_count, labels, stats, centroids = cv2.connectedComponentsWithStats(colored)
+    candidates: list[tuple[int, np.ndarray, float]] = []
+
+    for label_id in range(1, labels_count):
+        x, y, width, height, area = stats[label_id]
+        if not (3 <= width <= 40 and 3 <= height <= 40 and area >= 9):
+            continue
+        aspect = width / height
+        if not 0.35 <= aspect <= 2.8:
+            continue
+        if area / (width * height) < 0.35:
+            continue
+        candidates.append((label_id, labels == label_id, float(centroids[label_id][0])))
+
+    if len(candidates) < 3:
+        return []
+
+    median_x = float(np.median([candidate[2] for candidate in candidates]))
+    column = [candidate for candidate in candidates if abs(candidate[2] - median_x) <= 6]
+    if len(column) < 3:
+        return []
+
+    recovered: list[ColoredSegment] = []
+    for _, local_mask, _ in column:
+        full_mask = np.zeros((h_img, w_img), dtype=bool)
+        full_mask[:, x_offset:] = local_mask
+        area = int(full_mask.sum())
+        if any(int((full_mask & segment.mask).sum()) / area > 0.5 for segment in existing):
+            continue
+
+        mean_rgb = arr[full_mask].mean(axis=0).astype(np.uint8)
+        color_name = _pixel_hue_name(*map(float, mean_rgb))
+        if color_name is None or color_name in excluded_colors:
+            continue
+        pattern, pattern_color = COLOR_TO_PATTERN[color_name]
+        recovered.append(ColoredSegment(
+            mask=full_mask, color_name=color_name, pattern=pattern,
+            pattern_color=pattern_color, mean_rgb=tuple(int(v) for v in mean_rgb),
+            area=area, predicted_iou=1.0, stability_score=1.0,
+            is_legend=True,
+        ))
+
+    return recovered
 
 
 def _split_segment_by_brightness(seg, arr, color_to_pattern):
@@ -355,6 +393,63 @@ def _find_light_bars_opencv(
     return found
 
 
+def _find_missing_pie_slices_opencv(
+    arr: np.ndarray,
+    existing_segments: list["ColoredSegment"],
+    min_area: int,
+) -> list["ColoredSegment"]:
+    import cv2
+
+    data_masks = [segment.mask for segment in existing_segments if not segment.is_legend]
+    if not data_masks:
+        return []
+
+    covered = np.logical_or.reduce(data_masks)
+    covered_y, covered_x = np.where(covered)
+    if len(covered_x) == 0:
+        return []
+
+    x_min, x_max = int(covered_x.min()), int(covered_x.max())
+    y_min, y_max = int(covered_y.min()), int(covered_y.max())
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+    colored = ((hsv[:, :, 1] > 60) & (hsv[:, :, 2] > 35)).astype(np.uint8)
+    labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(colored)
+    required_area = max(50, min_area)
+    found: list[ColoredSegment] = []
+
+    for label_id in range(1, labels_count):
+        component_area = int(stats[label_id, cv2.CC_STAT_AREA])
+        if component_area < required_area:
+            continue
+
+        component = labels == label_id
+        ys, xs = np.where(component)
+        if len(xs) == 0:
+            continue
+        if xs.min() < x_min - 4 or xs.max() > x_max + 4:
+            continue
+        if ys.min() < y_min - 4 or ys.max() > y_max + 4:
+            continue
+
+        missing = component & ~covered
+        missing_area = int(missing.sum())
+        if missing_area < required_area:
+            continue
+
+        mean_rgb = arr[component].mean(axis=0).astype(np.uint8)
+        color_name = _pixel_hue_name(*map(float, mean_rgb))
+        if color_name is None or color_name in _NO_PATTERN:
+            continue
+        pattern, pattern_color = COLOR_TO_PATTERN[color_name]
+        found.append(ColoredSegment(
+            mask=missing, color_name=color_name, pattern=pattern,
+            pattern_color=pattern_color, mean_rgb=tuple(int(v) for v in mean_rgb),
+            area=missing_area, predicted_iou=0.6, stability_score=0.6,
+        ))
+
+    return found
+
+
 @dataclass
 class ColoredSegment:
     mask:            np.ndarray
@@ -365,6 +460,98 @@ class ColoredSegment:
     area:            int
     predicted_iou:   float
     stability_score: float
+    is_legend:       bool = False
+    series_id:       int | None = None
+
+
+@dataclass
+class PatternSeries:
+    series_id: int
+    mean_rgb: np.ndarray
+    area: int
+    members: list[ColoredSegment]
+
+
+def _lab_color_distance(left: tuple | np.ndarray, right: tuple | np.ndarray) -> float:
+    import cv2
+
+    colors = np.array([left[:3], right[:3]], dtype=np.uint8).reshape(2, 1, 3)
+    lab = cv2.cvtColor(colors, cv2.COLOR_RGB2LAB).astype(np.float32).reshape(2, 3)
+    return float(np.linalg.norm(lab[0] - lab[1]))
+
+
+def assign_patterns_by_series(
+    segments: list[ColoredSegment],
+    color_distance_threshold: float = 42.0,
+) -> list[ColoredSegment]:
+    if not segments:
+        return segments
+
+    data_segments = sorted(
+        (segment for segment in segments if not segment.is_legend),
+        key=lambda segment: -segment.area,
+    )
+    legend_segments = [segment for segment in segments if segment.is_legend]
+    series: list[PatternSeries] = []
+
+    for segment in data_segments:
+        closest = min(
+            series,
+            key=lambda candidate: _lab_color_distance(segment.mean_rgb, candidate.mean_rgb),
+            default=None,
+        )
+        if closest is None or _lab_color_distance(segment.mean_rgb, closest.mean_rgb) > color_distance_threshold:
+            closest = PatternSeries(
+                series_id=len(series),
+                mean_rgb=np.asarray(segment.mean_rgb, dtype=np.float32),
+                area=0,
+                members=[],
+            )
+            series.append(closest)
+        total_area = closest.area + segment.area
+        closest.mean_rgb = (
+            closest.mean_rgb * closest.area
+            + np.asarray(segment.mean_rgb, dtype=np.float32) * segment.area
+        ) / total_area
+        closest.area = total_area
+        closest.members.append(segment)
+
+    for segment in legend_segments:
+        closest = min(
+            series,
+            key=lambda candidate: _lab_color_distance(segment.mean_rgb, candidate.mean_rgb),
+            default=None,
+        )
+        legend_threshold = color_distance_threshold * 1.4
+        if closest is None or _lab_color_distance(segment.mean_rgb, closest.mean_rgb) > legend_threshold:
+            closest = PatternSeries(
+                series_id=len(series),
+                mean_rgb=np.asarray(segment.mean_rgb, dtype=np.float32),
+                area=0,
+                members=[],
+            )
+            series.append(closest)
+        total_area = closest.area + segment.area
+        closest.mean_rgb = (
+            closest.mean_rgb * closest.area
+            + np.asarray(segment.mean_rgb, dtype=np.float32) * segment.area
+        ) / total_area
+        closest.area = total_area
+        closest.members.append(segment)
+
+    for candidate in series:
+        rgb = tuple(int(value) for value in np.rint(candidate.mean_rgb))
+        color_name = _pixel_hue_name(*map(float, rgb))
+        if color_name is None:
+            color_name = "blue"
+        pattern, pattern_color = COLOR_TO_PATTERN[color_name]
+        for member in candidate.members:
+            member.series_id = candidate.series_id
+            member.color_name = color_name
+            member.pattern = pattern
+            member.pattern_color = pattern_color
+
+    return segments
 
 
 class SAMSegmenter:
@@ -443,6 +630,11 @@ class SAMSegmenter:
 
         all_found: list[ColoredSegment] = []
         legend_segments = _find_legend_squares_opencv(arr, excluded_colors, is_pie=is_pie)
+        if is_pie:
+            recovered_markers = _find_missing_legend_markers_by_column(
+                arr, legend_segments, excluded_colors
+            )
+            legend_segments.extend(recovered_markers)
         print(f"[DEBUG LEGEND] found {len(legend_segments)}: {[(s.color_name, s.area) for s in legend_segments]}")
         all_found.extend(legend_segments)
 
@@ -451,38 +643,12 @@ class SAMSegmenter:
             area  = int(mask.sum())
             bbox  = raw["bbox"]
 
-            if area > total_pixels * max_area_ratio:
-                continue
+            if area > total_pixels * max_area_ratio: continue
+            if area < 50: continue
 
-            bw, bh = bbox[2], bbox[3]
-            if bw <= 0 or bh <= 0:
-                continue
-
-            aspect = bw / bh
-
-            # Для круговой диаграммы мелкие элементы внутри круга почти всегда
-            # являются текстом, цифрами или фрагментами границ.
-            if is_pie:
-                min_allowed_area = max(min_area, int(total_pixels * 0.008))
-
-                if area < min_allowed_area:
-                    continue
-
-                if bw < 25 or bh < 25:
-                    continue
-
-            else:
-                # Для обычных графиков сохраняем возможность находить
-                # маленькие квадраты легенды.
-                is_legend_square = (
-                        50 <= area < min_area
-                        and 0.4 < aspect < 2.5
-                        and bw <= 40
-                        and bh <= 40
-                )
-
-                if not is_legend_square and area < min_area:
-                    continue
+            aspect = bbox[2] / bbox[3] if bbox[3] > 0 else 0
+            is_legend_square = (50 <= area < min_area and 0.4 < aspect < 2.5)
+            if not is_legend_square and area < min_area: continue
 
             if _is_text_like(mask, bbox, area, arr):
                 if area > 3000:
@@ -522,6 +688,13 @@ class SAMSegmenter:
                 stability_score=float(raw.get("stability_score", 0.0)),
             ))
 
+        if is_pie:
+            missing_slices = _find_missing_pie_slices_opencv(
+                arr, all_found, min_area=min_area
+            )
+            print(f"[DEBUG PIE FALLBACK] found {len(missing_slices)}: {[(s.color_name, s.area) for s in missing_slices]}")
+            all_found.extend(missing_slices)
+
         result = sorted(all_found, key=lambda s: -s.area)
 
         if is_pie:
@@ -545,7 +718,7 @@ class SAMSegmenter:
     @staticmethod
     def _classify_region(pixels: np.ndarray, sample_n: int = 1000) -> tuple:
         if len(pixels) > sample_n:
-            idx = np.random.choice(len(pixels), sample_n, replace=False)
+            idx = np.linspace(0, len(pixels) - 1, sample_n, dtype=np.intp)
             pixels = pixels[idx]
         mean_rgb = tuple(int(v) for v in pixels.mean(axis=0))
         counts: dict[str, int] = {}
