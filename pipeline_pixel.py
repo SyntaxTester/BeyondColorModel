@@ -12,8 +12,8 @@ from PIL import Image, ImageDraw, ImageOps
 
 DEVICE = "cpu"
 from image_provenance import save_processed_image, validate_image_input
-from layout_detector import get_detector, FigureBlock
-from pixel_segmenter import apply_double_coding
+from layout_detector import get_detector
+from pixel_segmenter import apply_double_coding_with_report
 from contrast_checker import audit_image_contrast
 
 
@@ -104,13 +104,14 @@ class SegmentInfo:
     color: str
     pattern: str
     area_px: int
-    iou: float
+    iou: float | None
 
 @dataclass
 class FigureInfo:
     page: int
     bbox: tuple
     figure_source: str
+    chart_kind: str
     segments_found: int
     patterns_applied: list[str]
     contrast_before: float
@@ -162,21 +163,27 @@ class BeyondColorPipeline:
         self,
         layout_mode: str = "opencv",
         pattern_opacity: int = 100,
-        tile_size: int = 14,
         min_figure_area: int = 4000,
-        min_segment_area: int = 80,
         page_dpi: int = 150,
     ):
-        self.pattern_opacity   = pattern_opacity
-        self.tile_size         = tile_size
-        self.min_figure_area   = min_figure_area
-        self.min_segment_area  = min_segment_area
-        self.page_dpi          = page_dpi
+        self.pattern_opacity = pattern_opacity
+        self.min_figure_area = min_figure_area
+        self.page_dpi = page_dpi
+        self._layout_mode_request = layout_mode
+        self._layout_detector = None
+        self.layout_mode = "whole-image"
 
         print("[BeyondColor] Initialising pipeline (pixel mode)...")
-        self._layout_detector = get_detector(force_mode=layout_mode, device=DEVICE)
-        self.layout_mode = type(self._layout_detector).__name__
         print("[BeyondColor] Pipeline ready.\n")
+
+    def _get_layout_detector(self):
+        if self._layout_detector is None:
+            self._layout_detector = get_detector(
+                force_mode=self._layout_mode_request,
+                device=DEVICE,
+            )
+            self.layout_mode = type(self._layout_detector).__name__
+        return self._layout_detector
 
     def process_image(self, input_path: str | Path, output_path: str | Path) -> PipelineReport:
         start_t = time.perf_counter()
@@ -184,39 +191,23 @@ class BeyondColorPipeline:
         validate_image_input(source_img, input_path, output_path)
         img = source_img
 
-        # The OpenCV circle detector can find incidental circles in bar-chart
-        # dashboards and mark the whole image as a pie chart.  The pixel
-        # segmenter performs a more specific shape check itself, so do not
-        # force pie behaviour from this coarse layout hint.
-        source = "opencv"
-        blocks = [FigureBlock(0, 0, img.width, img.height, 1.0, source)]
-
-        final_img = img.copy()
-        all_fig_infos = []
-
-        for block in blocks:
-            crop = block.crop(img)
-            processed_crop, fig_info_list, n_segs = self._process_figure(
-                crop, page=1, bbox=block.bbox, source=block.source
-            )
-            if processed_crop.size != crop.size or block.source == "piechart":
-                final_img = processed_crop.convert("RGB")
-            else:
-                final_img.paste(processed_crop.convert("RGB").resize(
-                    (block.x2 - block.x1, block.y2 - block.y1), Image.LANCZOS
-                ), (block.x1, block.y1))
-            all_fig_infos.extend(fig_info_list)
+        final_img, all_fig_infos, _ = self._process_figure(
+            img,
+            page=1,
+            bbox=(0, 0, img.width, img.height),
+            source="image",
+        )
 
         save_processed_image(final_img, output_path)
 
         violations = sum(1 for f in all_fig_infos if f.violation_before)
         fixed      = sum(1 for f in all_fig_infos if f.violation_before and not f.violation_after)
-        compliance = max(0.0, 100.0 - (violations - fixed) * 10.0) if all_fig_infos else 100.0
+        compliance = _compliance_score(all_fig_infos)
 
         return PipelineReport(
             input_path=str(input_path),
             output_path=str(output_path),
-            layout_mode=self.layout_mode,
+            layout_mode="whole-image",
             device=DEVICE,
             pages_processed=1,
             figures_found=len(all_fig_infos),
@@ -242,15 +233,17 @@ class BeyondColorPipeline:
 
         t = time.perf_counter()
         doc = fitz.open(str(input_path))
+        page_count = doc.page_count
         all_fig_infos: list[FigureInfo] = []
         total_segs = 0
+        detector = self._get_layout_detector()
 
         for page_num, page in enumerate(doc):
-            print(f"  Page {page_num + 1}/{doc.page_count}...", end=" ")
+            print(f"  Page {page_num + 1}/{page_count}...", end=" ")
             mat  = fitz.Matrix(self.page_dpi / 72, self.page_dpi / 72)
             pix  = page.get_pixmap(matrix=mat, alpha=False)
             page_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            figure_blocks = self._layout_detector.detect(page_img, min_area=self.min_figure_area)
+            figure_blocks = detector.detect(page_img, min_area=self.min_figure_area)
             print(f"{len(figure_blocks)} figure(s)")
 
             for fig_block in figure_blocks:
@@ -280,14 +273,14 @@ class BeyondColorPipeline:
 
         violations = sum(1 for f in all_fig_infos if f.violation_before)
         fixed      = sum(1 for f in all_fig_infos if f.violation_before and not f.violation_after)
-        compliance = max(0.0, 100.0 - (violations - fixed) * 5.0)
+        compliance = _compliance_score(all_fig_infos)
 
         report = PipelineReport(
             input_path=str(input_path),
             output_path=str(output_path),
             layout_mode=self.layout_mode,
             device=DEVICE,
-            pages_processed=len(all_fig_infos),
+            pages_processed=page_count,
             figures_found=len(all_fig_infos),
             segments_total=total_segs,
             violations_detected=violations,
@@ -299,7 +292,12 @@ class BeyondColorPipeline:
         report.print_summary()
         return report
 
-    def process_bulk(self, input_paths: list[str | Path], output_dir: str | Path) -> list[PipelineReport]:
+    def process_bulk(
+        self,
+        input_paths: list[str | Path],
+        output_dir: str | Path,
+        continue_on_error: bool = False,
+    ) -> list[PipelineReport]:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         reports = []
@@ -317,6 +315,8 @@ class BeyondColorPipeline:
                     continue
                 reports.append(report)
             except Exception as e:
+                if not continue_on_error:
+                    raise
                 print(f"  ERROR: {e}")
         return reports
 
@@ -352,37 +352,45 @@ class BeyondColorPipeline:
         source: str = "unknown",
     ) -> tuple[Image.Image, list[FigureInfo], int]:
 
-        audit_before = audit_image_contrast(figure_img, sample_count=150)
-
-        # Pixel double coding - красим каждый пиксель по цвету
-        processed = apply_double_coding(
+        audit_before = audit_image_contrast(figure_img)
+        coding = apply_double_coding_with_report(
             figure_img,
             opacity=self.pattern_opacity,
-            figure_source=source,
         )
+        processed = coding.image
 
-        audit_after = audit_image_contrast(processed, sample_count=150)
+        audit_after = audit_image_contrast(processed)
+        patterns = sorted({segment.pattern for segment in coding.segments})
 
         fig_info = FigureInfo(
-            page=page, bbox=bbox, figure_source=source,
-            segments_found=1,
-            patterns_applied=["pixel_double_coding"],
+            page=page, bbox=bbox, figure_source=source, chart_kind=coding.chart_kind,
+            segments_found=len(coding.segments),
+            patterns_applied=patterns,
             contrast_before=round(audit_before.mean_ratio, 2),
             contrast_after=round(audit_after.mean_ratio, 2),
             violation_before=not audit_before.overall_pass,
             violation_after=not audit_after.overall_pass,
-            segments=[],
+            segments=[
+                SegmentInfo(
+                    color=segment.color,
+                    pattern=segment.pattern,
+                    area_px=segment.area_px,
+                    iou=None,
+                )
+                for segment in coding.segments
+            ],
         )
-        return processed, [fig_info], 1
+        return processed, [fig_info], len(coding.segments)
 
 
-_default_pipeline: BeyondColorPipeline | None = None
+def _compliance_score(figures: list[FigureInfo]) -> float:
+    if not figures:
+        return 100.0
+    passing = sum(1 for figure in figures if not figure.violation_after)
+    return 100.0 * passing / len(figures)
 
 def _get_pipeline(**kwargs) -> BeyondColorPipeline:
-    global _default_pipeline
-    if _default_pipeline is None:
-        _default_pipeline = BeyondColorPipeline(**kwargs)
-    return _default_pipeline
+    return BeyondColorPipeline(**kwargs)
 
 def process_image(input_path: str, output_path: str, **kwargs) -> PipelineReport:
     return _get_pipeline(**kwargs).process_image(input_path, output_path)
@@ -390,8 +398,17 @@ def process_image(input_path: str, output_path: str, **kwargs) -> PipelineReport
 def process_pdf(input_path: str, output_path: str, **kwargs) -> PipelineReport:
     return _get_pipeline(**kwargs).process_pdf(input_path, output_path)
 
-def process_bulk(input_paths: list[str], output_dir: str, **kwargs) -> list[PipelineReport]:
-    return _get_pipeline(**kwargs).process_bulk(input_paths, output_dir)
+def process_bulk(
+    input_paths: list[str],
+    output_dir: str,
+    continue_on_error: bool = False,
+    **kwargs,
+) -> list[PipelineReport]:
+    return _get_pipeline(**kwargs).process_bulk(
+        input_paths,
+        output_dir,
+        continue_on_error=continue_on_error,
+    )
 
 
 def process_test_suite(
@@ -429,7 +446,6 @@ if __name__ == "__main__":
         reports, contact_sheet = process_test_suite(
             PROJECT_DIR,
             output_dir,
-            PROJECT_DIR / "output2.png",
         )
         print(json.dumps({"total": len(reports), "contact_sheet": str(contact_sheet)}, indent=2))
         sys.exit(0)

@@ -25,7 +25,6 @@ def main() -> int:
         reports, contact_sheet = process_test_suite(
             PROJECT_DIR,
             output_dir,
-            PROJECT_DIR / "output2.png",
         )
         print(json.dumps({"total": len(reports), "contact_sheet": str(contact_sheet)}, indent=2))
         return 0

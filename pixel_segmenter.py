@@ -75,6 +75,39 @@ class _PixelSeries:
     spacing_scale: float = 1.0
 
 
+@dataclass(frozen=True)
+class DoubleCodingSegment:
+    color: str
+    pattern: str
+    area_px: int
+
+
+@dataclass(frozen=True)
+class DoubleCodingResult:
+    image: Image.Image
+    chart_kind: str
+    segments: tuple[DoubleCodingSegment, ...]
+
+
+@dataclass(frozen=True)
+class _ChartClassification:
+    kind: str
+    line_mask: np.ndarray
+    thin_mask: np.ndarray
+    legend_mask: np.ndarray
+    pie_mask: np.ndarray
+
+
+def _rgb_label(rgb: np.ndarray) -> str:
+    values = np.rint(np.clip(rgb[:3], 0, 255)).astype(np.uint8)
+    return f"#{values[0]:02x}{values[1]:02x}{values[2]:02x}"
+
+
+def _series_pattern_label(series: _PixelSeries) -> str:
+    angle = int(round(np.rad2deg(series.angle_rad))) % 180
+    return f"{series.family}@{angle}"
+
+
 def _lab_distance(left: np.ndarray, right: np.ndarray) -> float:
     import cv2
 
@@ -388,42 +421,34 @@ def _draw_series_patterns(
     protected: np.ndarray,
     spacing: float,
 ) -> np.ndarray:
-    import cv2
-
     h_img, w_img = arr.shape[:2]
-    yy, xx = np.mgrid[0:h_img, 0:w_img].astype(np.float32)
     result = arr.astype(np.float32)
     alpha = min(1.0, max(0.0, opacity / 100.0))
 
     for candidate in series:
-        bold = np.zeros((h_img, w_img), dtype=bool)
-        pattern = _draw_pattern(
-            candidate.family,
-            xx,
-            yy,
-            candidate.angle_rad,
-            bold,
-            spacing=spacing * candidate.spacing_scale,
-        )
         ink_rgb = _pattern_ink_color(candidate.mean_rgb)
         for mask in candidate.masks:
-            draw_here = mask & pattern & ~protected
-            # A very thin pie slice can fall entirely between global pattern
-            # strokes.  Give it a compact contrast cue at its visual centre
-            # so every represented series remains perceptible.
-            if (
-                draw_here.sum() < 16
-                and mask.sum() <= h_img * w_img * 0.02
-            ):
-                available = (mask & ~protected).astype(np.uint8)
-                distance = cv2.distanceTransform(available, cv2.DIST_L2, 5)
-                if distance.max() > 0:
-                    center_y, center_x = np.unravel_index(distance.argmax(), distance.shape)
-                    radius = 2.0 if distance.max() >= 2.5 else 1.5
-                    draw_here = available.astype(bool) & (
-                        (xx - center_x) ** 2 + (yy - center_y) ** 2 <= radius ** 2
-                    )
-            result[draw_here] = result[draw_here] * (1 - alpha) + ink_rgb * alpha
+            available = mask & ~protected
+            mask_y, mask_x = np.where(available)
+            if not len(mask_x):
+                continue
+
+            x1, x2 = int(mask_x.min()), int(mask_x.max()) + 1
+            y1, y2 = int(mask_y.min()), int(mask_y.max()) + 1
+            local_h, local_w = y2 - y1, x2 - x1
+            yy, xx = np.mgrid[0:local_h, 0:local_w].astype(np.float32)
+            local_spacing = max(4.0, min(spacing * candidate.spacing_scale, max(local_h, local_w)))
+            pattern = _draw_pattern(
+                candidate.family,
+                xx,
+                yy,
+                candidate.angle_rad,
+                np.zeros((local_h, local_w), dtype=bool),
+                spacing=local_spacing,
+            )
+            draw_here = available[y1:y2, x1:x2] & pattern
+            target = result[y1:y2, x1:x2]
+            target[draw_here] = target[draw_here] * (1 - alpha) + ink_rgb * alpha
 
     return result
 
@@ -1181,7 +1206,7 @@ def _place_markers_on_lines(
     marker_size: int = 9,
     step: int = 60,
     legend_handles: list | None = None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, tuple[DoubleCodingSegment, ...]]:
     import cv2
 
     clustered_colors = _cluster_line_colors(arr, lines_mask)
@@ -1199,11 +1224,11 @@ def _place_markers_on_lines(
         else clustered_colors
     )
     if not line_colors:
-        return result
+        return result, ()
 
     ys, xs = np.where(lines_mask)
     if len(ys) == 0:
-        return result
+        return result, ()
 
     occupied = np.zeros(lines_mask.shape, dtype=bool)
 
@@ -1229,6 +1254,16 @@ def _place_markers_on_lines(
         sel_i = (assign == ci) & on_line
         m[ys[sel_i], xs[sel_i]] = True
         series_mask.append(m)
+
+    line_segments = tuple(
+        DoubleCodingSegment(
+            color=_rgb_label(centers[ci]),
+            pattern=f"marker:{_MARKER_SHAPES[ci % len(_MARKER_SHAPES)]}",
+            area_px=int(series_mask[ci].sum()),
+        )
+        for ci in range(len(line_colors))
+        if int(series_mask[ci].sum()) >= 50
+    )
 
     kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     dil = [cv2.dilate(m.astype(np.uint8), kern).astype(bool) for m in series_mask]
@@ -1338,7 +1373,7 @@ def _place_markers_on_lines(
                          fill, outline)
             used += 1
 
-    return result
+    return result, line_segments
 
 
 def _is_line_chart(valid: np.ndarray, thin: np.ndarray, min_area: int = 150) -> bool:
@@ -1411,11 +1446,43 @@ def _find_thin_structures(valid: np.ndarray, erode_px: int = 2) -> np.ndarray:
     return thin
 
 
+def _line_component_mask(
+    thin: np.ndarray,
+    min_area: int,
+    min_span: int,
+    min_cross_span: int = 0,
+    max_fill_ratio: float = 1.0,
+) -> np.ndarray:
+    import cv2
+
+    labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        thin.astype(np.uint8), connectivity=4
+    )
+    lines = np.zeros_like(thin, dtype=bool)
+    for label_id in range(1, labels_count):
+        area = int(stats[label_id, cv2.CC_STAT_AREA])
+        width = int(stats[label_id, cv2.CC_STAT_WIDTH])
+        height = int(stats[label_id, cv2.CC_STAT_HEIGHT])
+        if area < min_area:
+            continue
+        if max(width, height) < min_span:
+            continue
+        if min(width, height) < min_cross_span:
+            continue
+        fill_ratio = area / (width * height) if width and height else 1.0
+        if fill_ratio > max_fill_ratio:
+            continue
+        lines |= labels == label_id
+    return lines
+
+
 def _find_mixed_chart_lines(arr: np.ndarray, valid: np.ndarray) -> np.ndarray:
     import cv2
 
     height, width = valid.shape
     min_line_area = max(150, int(height * width * 0.0006))
+    min_span = max(40, int(width * 0.18))
+    min_cross_span = max(10, int(height * 0.04))
     hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
     hue_bins = hsv[:, :, 0] // 6
     lines = np.zeros_like(valid)
@@ -1435,15 +1502,20 @@ def _find_mixed_chart_lines(arr: np.ndarray, valid: np.ndarray) -> np.ndarray:
             component_area = int(stats[label_id, cv2.CC_STAT_AREA])
             component_width = int(stats[label_id, cv2.CC_STAT_WIDTH])
             component_height = int(stats[label_id, cv2.CC_STAT_HEIGHT])
-            if component_area >= min_line_area and max(component_width, component_height) >= 40:
-                lines |= labels == label_id
+            if component_area < min_line_area:
+                continue
+            if component_width < min_span:
+                continue
+            if component_height < min_cross_span:
+                continue
+            fill_ratio = component_area / (component_width * component_height)
+            if fill_ratio > 0.22:
+                continue
+            lines |= labels == label_id
 
     return lines
 
 
-def _adaptive_spacing(h_img: int, w_img: int) -> float:
-    ref = max(h_img, w_img)
-    return max(8.0, min(ref / 100.0, 40.0))
 def _chart_pattern_spacing(series: list[_PixelSeries]) -> float:
     import cv2
 
@@ -1648,16 +1720,48 @@ def _pie_region_mask(colorful: np.ndarray) -> np.ndarray:
     return pie_regions.astype(bool)
 
 
-def _looks_like_pie(colorful: np.ndarray) -> bool:
-    return bool(_pie_region_mask(colorful).any())
+def _classify_chart_geometry(
+    arr: np.ndarray,
+    line_valid: np.ndarray,
+    colorful: np.ndarray,
+    protected: np.ndarray,
+    edge_background: np.ndarray,
+    detect_lines: bool,
+) -> _ChartClassification:
+    empty = np.zeros_like(line_valid, dtype=bool)
+    pie_regions = _pie_region_mask(colorful & ~protected)
+    if pie_regions.any():
+        return _ChartClassification("pie", empty, empty, empty, pie_regions)
+    if not detect_lines:
+        return _ChartClassification("diagram", empty, empty, empty, empty)
 
-def apply_double_coding(
+    line_candidates = line_valid & ~protected & ~edge_background
+    if not line_candidates.any():
+        return _ChartClassification("empty", empty, empty, empty, empty)
+
+    height, width = line_candidates.shape
+    thin = _find_thin_structures(line_candidates)
+    legend = _find_legend_squares(line_candidates)
+    data_thin = thin & ~legend
+    min_line_area = max(100, int(height * width * 0.00025))
+    min_span = max(40, int(width * 0.14))
+    line_mask = _line_component_mask(data_thin, min_line_area, min_span)
+    if line_mask.any() and _is_line_chart(line_candidates, data_thin):
+        return _ChartClassification("line", line_mask, thin, legend, empty)
+
+    mixed_lines = _find_mixed_chart_lines(arr, line_candidates)
+    if mixed_lines.any():
+        return _ChartClassification("mixed", mixed_lines, thin, legend, empty)
+
+    return _ChartClassification("diagram", empty, thin, legend, empty)
+
+
+def apply_double_coding_with_report(
     image: Image.Image,
     opacity: int = 100,
     smooth_shadows: bool = True,
-    figure_source: str = "unknown",
     exclude_text: bool = True,
-) -> Image.Image:
+) -> DoubleCodingResult:
     import cv2
 
     arr = np.array(image.convert("RGB"))
@@ -1678,43 +1782,31 @@ def apply_double_coding(
         & (arr_for_classification.min(axis=2) <= 248)
         & (sat >= 0.12)
     )
-    thin = np.zeros_like(line_valid)
-    legend = np.zeros_like(line_valid)
-    mixed_chart_lines = np.zeros_like(line_valid)
-    line_chart = False
-    lines_for_markers: np.ndarray | None = None
-    if exclude_text:
-        thin = _find_thin_structures(line_valid)
-        legend = _find_legend_squares(line_valid)
-        line_chart = _is_line_chart(line_valid, thin)
-        if line_chart:
-            labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(
-                thin.astype(np.uint8), connectivity=4
-            )
-            lines_for_markers = np.zeros_like(thin)
-            for label_id in range(1, labels_count):
-                if stats[label_id, cv2.CC_STAT_AREA] >= 150:
-                    lines_for_markers |= labels == label_id
-        else:
-            mixed_chart_lines = _find_mixed_chart_lines(arr, line_valid)
-
-    valid = (colorful | neutral) & (channel_max >= 30)
     protected = _protect_text_pixels(arr)
     edge_background = _edge_neutral_background(arr_for_classification)
+    classification = _classify_chart_geometry(
+        arr,
+        line_valid,
+        colorful,
+        protected,
+        edge_background,
+        detect_lines=exclude_text,
+    )
+
+    valid = (colorful | neutral) & (channel_max >= 30)
     valid &= ~protected
     valid &= ~edge_background
     if exclude_text:
-        if line_chart:
-            valid &= ~(_find_thin_structures(valid) & ~legend)
+        if classification.kind == "line":
+            valid &= ~(classification.thin_mask & ~classification.legend_mask)
+        elif classification.kind == "mixed":
+            valid &= ~classification.line_mask
         else:
-            valid &= ~(thin & ~legend)
+            valid &= ~(classification.thin_mask & ~classification.legend_mask)
 
-    # Detect the pie outline from coloured regions only.  A grey background
-    # can otherwise merge with a grey slice and hide the circular geometry.
-    pie_regions = _pie_region_mask(colorful & ~protected)
-    is_pie = figure_source == "piechart" or pie_regions.any()
-    if is_pie and pie_regions.any():
-        valid &= pie_regions
+    is_pie = classification.kind == "pie"
+    if is_pie:
+        valid &= classification.pie_mask
     color_distance_threshold = 12.0 if is_pie else 30.0
     min_data_fraction = 0.003 if is_pie else 0.0008
     series = _build_color_series(
@@ -1733,13 +1825,46 @@ def apply_double_coding(
         opacity,
         is_pie,
     )
-    marker_lines = lines_for_markers if line_chart else mixed_chart_lines
+    marker_lines = classification.line_mask
+    line_segments: tuple[DoubleCodingSegment, ...] = ()
     if marker_lines.any():
-        result = _place_markers_on_lines(
+        result, line_segments = _place_markers_on_lines(
             result.astype(np.uint8),
             marker_lines,
             arr,
             legend_handles=find_legend_handles(arr),
-        ).astype(np.float32)
+        )
+        result = result.astype(np.float32)
 
-    return Image.fromarray(result.astype(np.uint8))
+    chart_kind = classification.kind
+    if chart_kind == "diagram" and not series:
+        chart_kind = "empty"
+
+    area_segments = tuple(
+        DoubleCodingSegment(
+            color=_rgb_label(candidate.mean_rgb),
+            pattern=_series_pattern_label(candidate),
+            area_px=int(candidate.area),
+        )
+        for candidate in sorted(series, key=lambda item: -item.area)
+    )
+    segments = area_segments + line_segments
+    return DoubleCodingResult(
+        image=Image.fromarray(result.astype(np.uint8)),
+        chart_kind=chart_kind,
+        segments=segments,
+    )
+
+
+def apply_double_coding(
+    image: Image.Image,
+    opacity: int = 100,
+    smooth_shadows: bool = True,
+    exclude_text: bool = True,
+) -> Image.Image:
+    return apply_double_coding_with_report(
+        image,
+        opacity=opacity,
+        smooth_shadows=smooth_shadows,
+        exclude_text=exclude_text,
+    ).image
