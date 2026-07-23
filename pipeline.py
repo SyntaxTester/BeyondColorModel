@@ -7,15 +7,21 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 import cv2
-import fitz
 import numpy as np
 from PIL import Image
 
 from model_loader import load_sam, get_device, DEVICE
 from layout_detector import get_detector, FigureBlock
-from segmenter import SAMSegmenter, deduplicate_segments, ColoredSegment
+from segmenter import (
+    SAMSegmenter,
+    assign_patterns_by_series,
+    deduplicate_segments,
+    ColoredSegment,
+)
 from pattern_renderer import render_patterns_on_segments
 from contrast_checker import audit_image_contrast
+from image_provenance import save_processed_image, validate_image_input
+from pixel_segmenter import classify_chart_kind
 
 
 @dataclass
@@ -161,7 +167,10 @@ class BeyondColorPipeline:
 
     def process_image(self, input_path: str | Path, output_path: str | Path) -> PipelineReport:
         start_t = time.perf_counter()
-        img = Image.open(input_path).convert("RGB")
+        with Image.open(input_path) as source:
+            source.load()
+            validate_image_input(source, input_path, output_path)
+            img = source.convert("RGB")
 
         blocks = self._layout_detector.detect(img, min_area=self.min_figure_area)
 
@@ -177,6 +186,12 @@ class BeyondColorPipeline:
             ]
             if len(blocks) > 3:
                 blocks = blocks[:1]
+
+        if not blocks:
+            # A standalone raster is still a chart even if a layout detector
+            # cannot find a page-level figure box.
+            w_img, h_img = img.size
+            blocks = [FigureBlock(0, 0, w_img, h_img, 1.0, "wholeimage")]
 
         final_img = img.copy()
         all_fig_infos = []
@@ -194,7 +209,7 @@ class BeyondColorPipeline:
                 ), (block.x1, block.y1))
             all_fig_infos.extend(fig_info_list)
 
-        final_img.save(output_path)
+        save_processed_image(final_img, output_path)
 
         violations = sum(1 for f in all_fig_infos if f.violation_before)
         fixed      = sum(1 for f in all_fig_infos if f.violation_before and not f.violation_after)
@@ -216,12 +231,20 @@ class BeyondColorPipeline:
         )
 
     def process_pdf(self, input_path: str | Path, output_path: str | Path) -> PipelineReport:
+        try:
+            import fitz
+        except ModuleNotFoundError as error:
+            raise RuntimeError(
+                "PDF processing requires PyMuPDF. Install it with: pip install PyMuPDF"
+            ) from error
+
         input_path  = Path(input_path)
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         t = time.perf_counter()
         doc = fitz.open(str(input_path))
+        page_count = doc.page_count
         all_fig_infos: list[FigureInfo] = []
         total_segs = 0
 
@@ -264,7 +287,7 @@ class BeyondColorPipeline:
             output_path=str(output_path),
             layout_mode=self.layout_mode,
             device=DEVICE,
-            pages_processed=len(all_fig_infos),
+            pages_processed=page_count,
             figures_found=len(all_fig_infos),
             segments_total=total_segs,
             violations_detected=violations,
@@ -285,7 +308,13 @@ class BeyondColorPipeline:
             out_path = output_dir / in_path.name
             print(f"\n[{i+1}/{len(input_paths)}] {in_path.name}")
             try:
-                report = self.process_pdf(in_path, out_path)
+                if in_path.suffix.lower() == ".pdf":
+                    report = self.process_pdf(in_path, out_path)
+                elif in_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+                    report = self.process_image(in_path, out_path)
+                else:
+                    print("  SKIP: unsupported file type")
+                    continue
                 reports.append(report)
             except Exception as e:
                 print(f"  ERROR: {e}")
@@ -331,15 +360,21 @@ class BeyondColorPipeline:
             sample_count=150,
         )
 
+        chart_kind = classify_chart_kind(figure_img)
+        is_pie = chart_kind == "pie"
         raw_segments = self._segmenter.segment(
             figure_img,
             min_area=self.min_segment_area,
-            is_pie=(source == "piechart"),
+            is_pie=is_pie,
         )
 
         segments = deduplicate_segments(
             raw_segments,
-            iou_threshold=0.5 if source == "piechart" else 0.7,
+            iou_threshold=0.5 if is_pie else 0.7,
+        )
+        segments = assign_patterns_by_series(
+            segments,
+            color_distance_threshold=12.0 if is_pie else 42.0,
         )
 
         if segments:
@@ -431,4 +466,4 @@ if __name__ == "__main__":
         report.print_summary()
     else:
         print("Unsupported file type.")
-        sys.exit(1)     
+        sys.exit(1)

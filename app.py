@@ -2,7 +2,9 @@ import io
 
 import streamlit as st
 from PIL import Image
+from PIL.PngImagePlugin import PngInfo
 
+from image_provenance import PROCESSING_MARKER, PROCESSING_VERSION
 from pixel_segmenter import apply_double_coding
 
 
@@ -26,7 +28,12 @@ for f in files:
     st.subheader(f.name)
 
     try:
-        img = Image.open(f).convert("RGB")
+        with Image.open(f) as source:
+            source.load()
+            if source.info.get(PROCESSING_MARKER) == PROCESSING_VERSION:
+                st.error("Этот файл уже обработан. Загрузите исходное изображение, чтобы не наложить паттерны второй раз.")
+                continue
+            img = source.convert("RGB")
     except Exception:
         st.error(f"Не удалось открыть {f.name} - файл повреждён или это не картинка")
         continue
@@ -43,7 +50,9 @@ for f in files:
     right.image(out, caption="стало", use_container_width=True)
 
     buf = io.BytesIO()
-    out.save(buf, format="PNG")
+    png_info = PngInfo()
+    png_info.add_text(PROCESSING_MARKER, PROCESSING_VERSION)
+    out.save(buf, format="PNG", pnginfo=png_info)
     st.download_button(
         label=f"Скачать результат ({f.name})",
         data=buf.getvalue(),
