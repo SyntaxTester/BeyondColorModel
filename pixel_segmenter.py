@@ -9,7 +9,57 @@ _ANGLE_LUT = [
     0, 90, 22.5, 112.5, 45, 135, 67.5, 157.5,
     11.25, 101.25, 33.75, 123.75, 56.25, 146.25, 78.75, 168.75,
 ]
-_PATTERN_FAMILIES = ["lines", "dots", "grid", "dashed", "waves", "zigzag", "crosshatch", "bricks"]
+_PATTERN_FAMILIES = [
+    "dots", "herringbone", "triangles", "lines", "rings", "star", "plus",
+    "checker",
+]
+
+_PATTERN_FILL = {
+    "dots": 0.2193,
+    "herringbone": 0.1875,
+    "triangles": 0.3594,
+    "lines": 0.2969,
+    "rings": 0.1320,
+    "star": 0.3381,
+    "plus": 0.6000,
+    "checker": 0.4900,
+}
+
+_SHAPE_FAMILIES = {"star", "triangles", "rings", "plus"}
+
+_LEGEND_SHAPE = {
+    "star": (0.50, 1.00, 1.01),
+    "plus": (0.50, 1.00, 0.72),
+    "triangles": (0.50, 1.00, 0.75),
+    "rings": (0.85, 1.70, 1.50),
+}
+
+
+_PATTERN_DIST = [
+    [0.00, 0.32, 0.29, 0.99, 0.51, 0.54, 0.43, 0.78],
+    [0.32, 0.00, 0.39, 1.14, 0.42, 0.52, 0.49, 0.69],
+    [0.29, 0.39, 0.00, 0.97, 0.33, 0.32, 0.22, 0.58],
+    [0.99, 1.14, 0.97, 0.00, 1.04, 0.97, 0.98, 1.15],
+    [0.51, 0.42, 0.33, 1.04, 0.00, 0.26, 0.38, 0.39],
+    [0.54, 0.52, 0.32, 0.97, 0.26, 0.00, 0.33, 0.42],
+    [0.43, 0.49, 0.22, 0.98, 0.38, 0.33, 0.00, 0.60],
+    [0.78, 0.69, 0.58, 1.15, 0.39, 0.42, 0.60, 0.00],
+]
+
+
+def _pick_families(n: int) -> list:
+    total = len(_PATTERN_FAMILIES)
+    if n >= total:
+        return list(range(total))
+    if n <= 1:
+        return [0]
+    import itertools
+    best = None
+    for combo in itertools.combinations(range(total), n):
+        worst = min(_PATTERN_DIST[a][b] for a, b in itertools.combinations(combo, 2))
+        if best is None or worst > best[0]:
+            best = (worst, combo)
+    return list(best[1])
 
 
 def _smooth_shadows(arr_rgb: np.ndarray) -> np.ndarray:
@@ -26,15 +76,19 @@ def _get_present_sectors(hue_smooth: np.ndarray, valid: np.ndarray) -> set[int]:
         return present
     for s in range(_N_SECTORS):
         count = ((sector == s) & valid).sum()
-        if count > total_valid * 0.008:
+        if count > total_valid * 0.020:
             present.add(s)
     return present
 
 
 def _assign_pattern_families(present_sectors: set[int]) -> dict[int, str]:
-    n_families = len(_PATTERN_FAMILIES)
     sectors_sorted = sorted(present_sectors)
-    return {s: _PATTERN_FAMILIES[i % n_families] for i, s in enumerate(sectors_sorted)}
+    n = len(sectors_sorted)
+    if n == 0:
+        return {}
+    picked = _pick_families(n)
+    return {s: _PATTERN_FAMILIES[picked[i % len(picked)]]
+            for i, s in enumerate(sectors_sorted)}
 
 
 _MARKER_SHAPES = ["circle", "square", "triangle", "diamond", "cross", "star"]
@@ -293,6 +347,41 @@ def _marker_colors(series_rgb: np.ndarray) -> tuple:
     return fill, outline
 
 
+def _find_peaks(cx_all, cy_all, smooth: int = 9, prominence: float = 3.0,
+                min_gap: int = 12) -> list:
+    if len(cx_all) < 40:
+        return []
+    order = np.argsort(cx_all)
+    xs_s = cx_all[order]
+    ys_s = cy_all[order]
+    ux = np.unique(xs_s)
+    if len(ux) < 20:
+        return []
+    med = np.zeros(len(ux), dtype=np.float64)
+    start = 0
+    for i, x in enumerate(ux):
+        end = start
+        while end < len(xs_s) and xs_s[end] == x:
+            end += 1
+        med[i] = np.median(ys_s[start:end])
+        start = end
+    kern = np.ones(smooth) / smooth
+    sm = np.convolve(med, kern, mode="same")
+    d = np.diff(sm)
+    raw = []
+    for i in range(2, len(d) - 2):
+        if d[i - 1] * d[i] < 0:
+            lo = max(0, i - 15)
+            hi = min(len(sm), i + 15)
+            if abs(sm[i] - sm[lo:hi].mean()) >= prominence:
+                raw.append(int(ux[i]))
+    out = []
+    for x in raw:
+        if not out or x - out[-1] > min_gap:
+            out.append(x)
+    return out
+
+
 def _place_markers_on_lines(
     result: np.ndarray,
     lines_mask: np.ndarray,
@@ -411,11 +500,14 @@ def _place_markers_on_lines(
             idx = np.linspace(0, len(cross_x) - 1, cap).astype(int)
             cross_x = [cross_x[i] for i in sorted(set(idx))]
 
-        plan = [(0, x) for x in cross_x]
-        plan.extend((1, x) for x in anchors)
+        peaks = _find_peaks(cx_all, cy_all)
+
+        plan = [(0, x) for x in peaks]
+        plan.extend((1, x) for x in cross_x)
+        plan.extend((2, x) for x in anchors)
         plan.sort()
 
-        budget = len(anchors) * 2
+        budget = len(anchors) * 2 + len(peaks)
         used = 0
 
         for prio, x_target in plan:
@@ -523,7 +615,7 @@ def _find_thin_structures(valid: np.ndarray, erode_px: int = 2) -> np.ndarray:
 
 def _adaptive_spacing(h_img: int, w_img: int) -> float:
     ref = max(h_img, w_img)
-    return max(8.0, min(ref / 100.0, 40.0))
+    return max(13.0, min(ref / 60.0, 60.0))
 
 
 def _draw_pattern(
@@ -533,54 +625,86 @@ def _draw_pattern(
     bold: np.ndarray,
     spacing: float = 12.0,
 ) -> np.ndarray:
+    k = _PATTERN_FILL.get(family, 0.25)
+    base = spacing * 0.72 if bool(np.asarray(bold).ravel()[0]) else spacing
+    sp = float(max(4, int(round(base))))
+
+    def _px(value):
+        return float(max(1, int(round(value))))
+
     cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
     proj = xx * cos_a + yy * sin_a
     perp = -xx * sin_a + yy * cos_a
 
-    width_ratio = np.where(bold, 0.40, 0.20)
+    if family == "dots":
+        gx = proj % sp
+        gy = perp % sp
+        c = sp / 2
+        r = _px(sp * k)
+        return (gx - c) ** 2 + (gy - c) ** 2 <= r ** 2
+
+    if family == "herringbone":
+        row = np.floor(perp / (sp * 0.9))
+        flip = (row % 2) == 1
+        d = np.where(flip, proj + perp, proj - perp)
+        return (d % sp) < _px(sp * k)
+
+    if family == "triangles":
+        u = (proj % sp) / sp
+        v = (perp % sp) / sp
+        cu = u - 0.5
+        v0 = 0.5 - k
+        v1 = 0.5 + k
+        t = np.clip((v - v0) / (v1 - v0), 0.0, 1.0)
+        return (v >= v0) & (v <= v1) & (np.abs(cu) <= k * t)
 
     if family == "lines":
-        return (proj % spacing) < (spacing * width_ratio)
+        return (proj % sp) < _px(sp * k)
 
-    if family == "dashed":
-        line = (proj % spacing) < (spacing * width_ratio)
-        dash_period = np.where(bold, spacing * 1.2, spacing * 2.2)
-        dash = (perp % dash_period) < (dash_period * 0.5)
-        return line & dash
+    if family == "rings":
+        gx = (proj % (sp * 1.7)) - sp * 0.85
+        gy = (perp % (sp * 1.7)) - sp * 0.85
+        d = np.sqrt(gx ** 2 + gy ** 2)
+        return np.abs(d - _px(sp * 0.62)) < _px(sp * k)
 
-    if family == "grid":
-        line1 = (proj % spacing) < (spacing * width_ratio * 0.7)
-        line2 = (perp % spacing) < (spacing * width_ratio * 0.7)
-        return line1 | line2
+    if family == "plus":
+        row = np.floor(perp / sp)
+        off = (row % 2) * sp * 0.5
+        u = ((proj + off) % sp) - sp * 0.5
+        v = (perp % sp) - sp * 0.5
+        arm = _px(sp * k * 0.60)
+        th = _px(sp * k * 0.20)
+        return ((np.abs(u) < th) & (np.abs(v) < arm)) | \
+               ((np.abs(v) < th) & (np.abs(u) < arm))
 
-    if family == "dots":
-        gx = (proj % spacing)
-        gy = (perp % spacing)
-        cx = cy = spacing / 2
-        r = spacing * np.where(bold, 0.30, 0.16)
-        return (gx - cx) ** 2 + (gy - cy) ** 2 <= r ** 2
+    if family == "star":
+        u = ((proj % sp) / sp) - 0.5
+        v = ((perp % sp) / sp) - 0.5
+        r = np.sqrt(u ** 2 + v ** 2) + 1e-6
+        ang = np.arctan2(v, u)
+        lobe = 0.5 + 0.5 * np.cos(ang * 5.0)
+        return r < (k * (0.5 + 1.0 * lobe))
 
-    if family == "waves":
-        wave = np.sin(proj / spacing * 2 * np.pi) * (spacing * 0.3)
-        return np.abs((perp % spacing) - spacing / 2 - wave) < (spacing * width_ratio)
+    if family == "checker":
+        a = np.floor(proj / sp).astype(np.int64)
+        b = np.floor(perp / sp).astype(np.int64)
+        return ((a + b) % 2) == 0
 
-    if family == "zigzag":
-        tri = np.abs((proj % spacing) - spacing / 2)
-        return np.abs((perp % spacing) - tri) < (spacing * width_ratio)
+    return (proj % sp) < (sp * 0.25)
 
-    if family == "crosshatch":
-        d1 = ((proj + perp) % spacing) < (spacing * width_ratio * 0.7)
-        d2 = ((proj - perp) % spacing) < (spacing * width_ratio * 0.7)
-        return d1 | d2
 
-    if family == "bricks":
-        row = np.floor(perp / spacing)
-        offset = (row % 2) * (spacing / 2)
-        hline = (perp % spacing) < (spacing * width_ratio * 0.6)
-        vline = ((proj + offset) % spacing) < (spacing * width_ratio * 0.6)
-        return hline | vline
-
-    return (proj % spacing) < (spacing * width_ratio)
+def _stabilize_sectors(sector: np.ndarray, valid: np.ndarray,
+                       win: int = 7) -> np.ndarray:
+    import cv2
+    best = np.zeros(sector.shape, dtype=np.float32)
+    out = sector.copy()
+    for k in range(_N_SECTORS):
+        m = ((sector == k) & valid).astype(np.float32)
+        c = cv2.boxFilter(m, -1, (win, win), normalize=True)
+        upd = c > best
+        best = np.where(upd, c, best)
+        out = np.where(upd, k, out)
+    return np.where(valid, out, sector).astype(np.int32)
 
 
 def _procedural_pattern_mask(
@@ -596,6 +720,7 @@ def _procedural_pattern_mask(
     bold = sat_smooth > 0.5
 
     sector = np.floor(hue_smooth / (360.0 / _N_SECTORS)).astype(np.int32) % _N_SECTORS
+    sector = _stabilize_sectors(sector, valid)
     present = _get_present_sectors(hue_smooth, valid)
     family_map = _assign_pattern_families(present)
 
@@ -606,10 +731,25 @@ def _procedural_pattern_mask(
         sector_mask = (sector == s)
         if not sector_mask.any():
             continue
-        angle_rad = np.deg2rad(_ANGLE_LUT[s])
         family = family_map.get(s, "lines")
-        pattern = _draw_pattern(family, xx, yy, angle_rad, bold,
-                                spacing=_adaptive_spacing(h_img, w_img))
+        angle_rad = 0.0 if family in _SHAPE_FAMILIES \
+            else np.deg2rad(_ANGLE_LUT[s])
+        sector_bold = np.full(sector_mask.shape,
+                              bool(bold[sector_mask].mean() > 0.5))
+        sp_use = _adaptive_spacing(h_img, w_img)
+        ys_s, xs_s = np.where(sector_mask)
+        span = min(xs_s.max() - xs_s.min(), ys_s.max() - ys_s.min()) + 1
+        if span < sp_use * 3.0:
+            sp_use = max(6.0, span / 3.0)
+        sp_use = float(max(4, int(round(sp_use))))
+        if family in _SHAPE_FAMILIES:
+            ox = float(int(round(xs_s.mean() - sp_use * 0.5)))
+            oy = float(int(round(ys_s.mean() - sp_use * 0.5)))
+        else:
+            ox = 0.0
+            oy = 0.0
+        pattern = _draw_pattern(family, xx - ox, yy - oy, angle_rad,
+                                sector_bold, spacing=sp_use)
         result |= (sector_mask & pattern)
 
     return result
@@ -666,7 +806,8 @@ def _redraw_small_elements(
                 key=lambda s: np.linalg.norm(sector_rgb[s] - elem_rgb)
             )
         family = family_map.get(best_sector, "lines")
-        angle_rad = np.deg2rad(_ANGLE_LUT[best_sector])
+        angle_rad = 0.0 if family in _SHAPE_FAMILIES \
+            else np.deg2rad(_ANGLE_LUT[best_sector])
 
         cx = int(centroids[i][0])
         cy = int(centroids[i][1])
@@ -682,12 +823,30 @@ def _redraw_small_elements(
         is_bold = (rep_hsv[1] / 255.0) > 0.5
         bold = np.full((h_img, w_img), is_bold, dtype=bool)
 
-        pattern = _draw_pattern(family, xx, yy, angle_rad, bold,
-                                spacing=MARKER / 3.0)
+        if family in _SHAPE_FAMILIES:
+            centre_f, period_f, extent_f = _LEGEND_SHAPE[family]
+            target = MARKER / 1.42
+            leg_sp = target / extent_f
+            ccx = (x0 + x1 - 1) * 0.5
+            ccy = (y0 + y1 - 1) * 0.5
+            ca, sa = np.cos(angle_rad), np.sin(angle_rad)
+            rx = (xx - ccx) * ca + (yy - ccy) * sa
+            ry = -(xx - ccx) * sa + (yy - ccy) * ca
+            half = leg_sp * period_f * 0.5
+            inside = (np.abs(rx) < half) & (np.abs(ry) < half)
+            pattern = _draw_pattern(family, rx + leg_sp * centre_f,
+                                    ry + leg_sp * centre_f, 0.0, bold,
+                                    spacing=leg_sp) & inside
+        else:
+            pattern = _draw_pattern(family, xx - x0, yy - y0, angle_rad, bold,
+                                    spacing=MARKER / 2.0)
         block = np.zeros((h_img, w_img), dtype=bool)
         block[y0:y1, x0:x1] = True
         draw_here = block & pattern
-        result[draw_here] = result[draw_here] * (1 - alpha)
+        el = sector_rgb[best_sector].astype(np.float32)
+        el_lum = 0.2126 * el[0] + 0.7152 * el[1] + 0.0722 * el[2]
+        el_ink = 255.0 if el_lum < 128.0 else 0.0
+        result[draw_here] = (result[draw_here] * (1 - alpha) + el_ink * alpha)
 
     return result
 
@@ -706,6 +865,7 @@ def _procedural_pattern_mask_with_families(
     bold = sat_smooth > 0.5
 
     sector = np.floor(hue_smooth / (360.0 / _N_SECTORS)).astype(np.int32) % _N_SECTORS
+    sector = _stabilize_sectors(sector, valid)
     present = _get_present_sectors(hue_smooth, valid)
     family_map = _assign_pattern_families(present)
 
@@ -731,13 +891,100 @@ def _procedural_pattern_mask_with_families(
         sector_mask = (sector == s)
         if not sector_mask.any():
             continue
-        angle_rad = np.deg2rad(_ANGLE_LUT[s])
         family = family_map.get(s, "lines")
-        pattern = _draw_pattern(family, xx, yy, angle_rad, bold,
-                                spacing=_adaptive_spacing(h_img, w_img))
+        angle_rad = 0.0 if family in _SHAPE_FAMILIES \
+            else np.deg2rad(_ANGLE_LUT[s])
+        sector_bold = np.full(sector_mask.shape,
+                              bool(bold[sector_mask].mean() > 0.5))
+        sp_use = _adaptive_spacing(h_img, w_img)
+        ys_s, xs_s = np.where(sector_mask)
+        span = min(xs_s.max() - xs_s.min(), ys_s.max() - ys_s.min()) + 1
+        if span < sp_use * 3.0:
+            sp_use = max(6.0, span / 3.0)
+        sp_use = float(max(4, int(round(sp_use))))
+        if family in _SHAPE_FAMILIES:
+            ox = float(int(round(xs_s.mean() - sp_use * 0.5)))
+            oy = float(int(round(ys_s.mean() - sp_use * 0.5)))
+        else:
+            ox = 0.0
+            oy = 0.0
+        pattern = _draw_pattern(family, xx - ox, yy - oy, angle_rad,
+                                sector_bold, spacing=sp_use)
         result |= (sector_mask & pattern)
 
     return result, present, family_map, sector_rgb
+
+
+def _detect_background(arr: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    import cv2
+    h, w = arr.shape[:2]
+    out = np.zeros((h, w), dtype=bool)
+
+    limit = 900
+    if max(h, w) > limit:
+        sc = limit / float(max(h, w))
+        small = cv2.resize(arr, (max(1, int(w * sc)), max(1, int(h * sc))),
+                           interpolation=cv2.INTER_AREA)
+    else:
+        small = arr
+
+    sh, sw = small.shape[:2]
+    stotal = sh * sw
+    q = (small.astype(np.int32) // 24 * 24)
+    packed = (q[:, :, 0] << 16) | (q[:, :, 1] << 8) | q[:, :, 2]
+    vals, cnt = np.unique(packed.ravel(), return_counts=True)
+
+    for v, area in zip(vals, cnt):
+        if area < stotal * 0.15:
+            continue
+        c = np.array([(int(v) >> 16) & 255, (int(v) >> 8) & 255, int(v) & 255],
+                     dtype=np.int32)
+        mx, mn = int(c.max()), int(c.min())
+        if mn > 230 or mx < 60 or (mx - mn) < 25:
+            continue
+        ms = (np.abs(small.astype(np.int32) - c).max(axis=2) < 30)
+        ys, xs = np.where(ms)
+        if len(xs) < 20:
+            continue
+        spread_x = (xs.max() - xs.min()) / sw
+        spread_y = (ys.max() - ys.min()) / sh
+        if max(spread_x, spread_y) > 0.75:
+            out |= (np.abs(arr.astype(np.int32) - c).max(axis=2) < 30)
+    return out
+
+
+def _detect_text(arr: np.ndarray) -> np.ndarray:
+    import cv2
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    dark = (gray < 90).astype(np.uint8)
+    n, lab, st, cent = cv2.connectedComponentsWithStats(dark, 8)
+    cands = []
+    for i in range(1, n):
+        a = st[i, cv2.CC_STAT_AREA]
+        wd = st[i, cv2.CC_STAT_WIDTH]
+        ht = st[i, cv2.CC_STAT_HEIGHT]
+        fill = a / max(1, wd * ht)
+        if 4 <= a <= 400 and 3 <= wd <= 25 and 5 <= ht <= 28 and fill > 0.15:
+            cands.append((int(cent[i][0]), int(cent[i][1]), ht, i))
+    keep = set()
+    for a in range(len(cands)):
+        xa, ya, ha, ia = cands[a]
+        nb = 0
+        for b in range(len(cands)):
+            if b == a:
+                continue
+            xb, yb, hb, ib = cands[b]
+            if abs(ya - yb) <= ha and abs(xa - xb) <= ha * 4 and abs(ha - hb) <= 4:
+                nb += 1
+        if nb >= 2:
+            keep.add(ia)
+    m = np.zeros(arr.shape[:2], dtype=bool)
+    for i in keep:
+        m |= (lab == i)
+    if m.any():
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        m = cv2.dilate(m.astype(np.uint8), k).astype(bool)
+    return m
 
 
 def apply_double_coding(
@@ -768,6 +1015,9 @@ def apply_double_coding(
         (sat >= 0.12)
     )
 
+    bg_mask = _detect_background(arr_for_classification, valid)
+    valid = valid & ~bg_mask
+
     line_chart = False
     lines_for_markers = None
     if exclude_text:
@@ -793,11 +1043,43 @@ def apply_double_coding(
     big_mask, present, family_map, sector_rgb = _procedural_pattern_mask_with_families(
         h_img, w_img, hue, sat, valid, arr
     )
+    import cv2
+    _lh, _lw = arr.shape[:2]
+    if max(_lh, _lw) > 1400:
+        _sc = 1400.0 / float(max(_lh, _lw))
+        _sm = cv2.resize(arr, (max(1, int(_lw * _sc)), max(1, int(_lh * _sc))),
+                         interpolation=cv2.INTER_AREA)
+        local = cv2.resize(cv2.medianBlur(_sm, 21), (_lw, _lh),
+                           interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    else:
+        local = cv2.medianBlur(arr, 21).astype(np.float32)
+
     draw_mask = big_mask & valid
+    if exclude_text:
+        deviation = np.abs(arr.astype(np.float32) - local).sum(axis=2)
+        foreign = deviation > 100
+        halo = max(2, int(round(_adaptive_spacing(h_img, w_img) * 0.22)))
+        kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                         (halo * 2 + 1, halo * 2 + 1))
+        n_f, lab_f, st_f, _ = cv2.connectedComponentsWithStats(
+            foreign.astype(np.uint8), 8)
+        compact = np.zeros_like(foreign)
+        limit = _adaptive_spacing(h_img, w_img) * 2.5
+        for i in range(1, n_f):
+            if st_f[i, cv2.CC_STAT_WIDTH] <= limit and \
+                    st_f[i, cv2.CC_STAT_HEIGHT] <= limit:
+                compact |= (lab_f == i)
+        foreign = foreign | cv2.dilate(compact.astype(np.uint8),
+                                       kern).astype(bool)
+        draw_mask = draw_mask & ~foreign
 
     result = arr.astype(np.float32)
     alpha = opacity / 100.0
-    result[draw_mask] = result[draw_mask] * (1 - alpha)
+    lum = (0.2126 * local[:, :, 0] + 0.7152 * local[:, :, 1]
+           + 0.0722 * local[:, :, 2])
+    ink = np.where(lum[..., None] < 128.0, 255.0, 0.0)
+    result[draw_mask] = (result[draw_mask] * (1 - alpha)
+                         + ink[draw_mask] * alpha)
 
     result = _redraw_small_elements(
         arr, valid, result, alpha, family_map, sector_rgb
