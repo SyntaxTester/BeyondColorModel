@@ -2,18 +2,82 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
-import fitz
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageOps
 
 DEVICE = "cpu"
+from image_provenance import save_processed_image, validate_image_input
 from layout_detector import get_detector, FigureBlock
-from pixel_segmenter import apply_double_coding
+from pixel_segmenter import apply_double_coding_with_report
 from contrast_checker import audit_image_contrast
+
+
+Image.init()
+IMAGE_SUFFIXES = set(Image.registered_extensions()) - {".pdf"}
+PROJECT_DIR = Path(__file__).resolve().parent
+TEST_RESULTS_DIR = PROJECT_DIR / "processed_tests"
+TEST_IMAGE_STEM = re.compile(r"^test(?:[_ -]?(\d+))?$", re.IGNORECASE)
+
+
+def discover_test_images(input_dir: str | Path) -> list[Path]:
+    """Find numbered test images in natural order; gaps are allowed."""
+    input_dir = Path(input_dir)
+    paths = [
+        path for path in input_dir.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in IMAGE_SUFFIXES
+        and TEST_IMAGE_STEM.fullmatch(path.stem)
+    ]
+    def key(path: Path) -> tuple[int, str, str]:
+        match = TEST_IMAGE_STEM.fullmatch(path.stem)
+        assert match is not None
+        number = match.group(1)
+        return (int(number) if number is not None else -1, path.suffix.lower(), path.name.lower())
+    return sorted(paths, key=key)
+
+
+def load_input_image(input_path: str | Path) -> Image.Image:
+    """Load an image even when its extension is inaccurate."""
+    try:
+        with Image.open(input_path) as source:
+            source.load()
+            image = source.convert("RGB")
+            image.info.update(source.info)
+            return image
+    except OSError as pillow_error:
+        import cv2
+        bgr = cv2.imread(str(input_path), cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise pillow_error
+        return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+
+
+def create_contact_sheet(
+    image_paths: list[Path],
+    output_path: str | Path,
+    columns: int = 4,
+) -> Path:
+    thumbnail_size = (280, 200)
+    cell_width, cell_height = thumbnail_size[0] + 16, thumbnail_size[1] + 38
+    rows = max(1, (len(image_paths) + columns - 1) // columns)
+    sheet = Image.new("RGB", (columns * cell_width + 16, rows * cell_height + 16), "white")
+    draw = ImageDraw.Draw(sheet)
+    for index, image_path in enumerate(image_paths):
+        with Image.open(image_path) as source:
+            thumbnail = ImageOps.contain(source.convert("RGB"), thumbnail_size, Image.LANCZOS)
+        column, row = index % columns, index // columns
+        x, y = 16 + column * cell_width, 16 + row * cell_height
+        sheet.paste(thumbnail, (x, y))
+        draw.text((x, y + thumbnail_size[1] + 6), image_path.name, fill="black")
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(output_path, format="PNG")
+    return output_path
 
 
 @dataclass
@@ -21,13 +85,14 @@ class SegmentInfo:
     color: str
     pattern: str
     area_px: int
-    iou: float
+    iou: float | None
 
 @dataclass
 class FigureInfo:
     page: int
     bbox: tuple
     figure_source: str
+    chart_kind: str
     segments_found: int
     patterns_applied: list[str]
     contrast_before: float
@@ -88,61 +153,46 @@ class BeyondColorPipeline:
         self.min_figure_area   = min_figure_area
         self.min_segment_area  = min_segment_area
         self.page_dpi          = page_dpi
+        self._layout_mode_request = layout_mode
+        self._layout_detector = None
 
         print("[BeyondColor] Initialising pipeline (pixel mode)...")
-        self._layout_detector = get_detector(force_mode=layout_mode, device=DEVICE)
-        self.layout_mode = type(self._layout_detector).__name__
+        self.layout_mode = "whole-image"
         print("[BeyondColor] Pipeline ready.\n")
+
+    def _get_layout_detector(self):
+        if self._layout_detector is None:
+            self._layout_detector = get_detector(
+                force_mode=self._layout_mode_request,
+                device=DEVICE,
+            )
+            self.layout_mode = type(self._layout_detector).__name__
+        return self._layout_detector
 
     def process_image(self, input_path: str | Path, output_path: str | Path) -> PipelineReport:
         start_t = time.perf_counter()
-        img = Image.open(input_path).convert("RGB")
+        img = load_input_image(input_path)
+        validate_image_input(img, input_path, output_path)
 
-        blocks = self._layout_detector.detect(img, min_area=self.min_figure_area)
-
-        pie_blocks = [b for b in blocks if b.source == "piechart"]
-        if pie_blocks:
-            w_img, h_img = img.size
-            blocks = [type(pie_blocks[0])(0, 0, w_img, h_img, 1.0, "piechart")]
-        else:
-            blocks = [
-                b for b in blocks
-                if b.width >= 50 and b.height >= 50
-                and 0.1 < (b.width / b.height) < 10
-            ]
-            if len(blocks) > 3:
-                blocks = blocks[:1]
-
-        if not blocks:
-            w_img, h_img = img.size
-            blocks = [FigureBlock(0, 0, w_img, h_img, 1.0, "wholeimage")]
-
-        final_img = img.copy()
-        all_fig_infos = []
-
-        for block in blocks:
-            crop = block.crop(img)
-            processed_crop, fig_info_list, n_segs = self._process_figure(
-                crop, page=1, bbox=block.bbox, source=block.source
-            )
-            if block.source == "piechart":
-                final_img = processed_crop.convert("RGB")
-            else:
-                final_img.paste(processed_crop.convert("RGB").resize(
-                    (block.x2 - block.x1, block.y2 - block.y1), Image.LANCZOS
-                ), (block.x1, block.y1))
-            all_fig_infos.extend(fig_info_list)
-
-        final_img.save(output_path)
+        # A standalone raster is one visual chart.  Partial layout blocks can
+        # overlap and cause a second pattern pass, or produce no output when
+        # OpenCV misses a clean chart background.
+        final_img, all_fig_infos, _ = self._process_figure(
+            img,
+            page=1,
+            bbox=(0, 0, img.width, img.height),
+            source="image",
+        )
+        save_processed_image(final_img, output_path)
 
         violations = sum(1 for f in all_fig_infos if f.violation_before)
         fixed      = sum(1 for f in all_fig_infos if f.violation_before and not f.violation_after)
-        compliance = max(0.0, 100.0 - (violations - fixed) * 10.0) if all_fig_infos else 100.0
+        compliance = _compliance_score(all_fig_infos)
 
         return PipelineReport(
             input_path=str(input_path),
             output_path=str(output_path),
-            layout_mode=self.layout_mode,
+            layout_mode="whole-image",
             device=DEVICE,
             pages_processed=1,
             figures_found=len(all_fig_infos),
@@ -155,21 +205,30 @@ class BeyondColorPipeline:
         )
 
     def process_pdf(self, input_path: str | Path, output_path: str | Path) -> PipelineReport:
+        try:
+            import fitz
+        except ModuleNotFoundError as error:
+            raise RuntimeError(
+                "PDF processing requires PyMuPDF. Install it with: pip install PyMuPDF"
+            ) from error
+
         input_path  = Path(input_path)
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         t = time.perf_counter()
         doc = fitz.open(str(input_path))
+        page_count = doc.page_count
         all_fig_infos: list[FigureInfo] = []
         total_segs = 0
+        detector = self._get_layout_detector()
 
         for page_num, page in enumerate(doc):
-            print(f"  Page {page_num + 1}/{doc.page_count}...", end=" ")
+            print(f"  Page {page_num + 1}/{page_count}...", end=" ")
             mat  = fitz.Matrix(self.page_dpi / 72, self.page_dpi / 72)
             pix  = page.get_pixmap(matrix=mat, alpha=False)
             page_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            figure_blocks = self._layout_detector.detect(page_img, min_area=self.min_figure_area)
+            figure_blocks = detector.detect(page_img, min_area=self.min_figure_area)
             print(f"{len(figure_blocks)} figure(s)")
 
             for fig_block in figure_blocks:
@@ -196,14 +255,14 @@ class BeyondColorPipeline:
 
         violations = sum(1 for f in all_fig_infos if f.violation_before)
         fixed      = sum(1 for f in all_fig_infos if f.violation_before and not f.violation_after)
-        compliance = max(0.0, 100.0 - (violations - fixed) * 5.0)
+        compliance = _compliance_score(all_fig_infos)
 
         report = PipelineReport(
             input_path=str(input_path),
             output_path=str(output_path),
             layout_mode=self.layout_mode,
             device=DEVICE,
-            pages_processed=len(all_fig_infos),
+            pages_processed=page_count,
             figures_found=len(all_fig_infos),
             segments_total=total_segs,
             violations_detected=violations,
@@ -215,7 +274,12 @@ class BeyondColorPipeline:
         report.print_summary()
         return report
 
-    def process_bulk(self, input_paths: list[str | Path], output_dir: str | Path) -> list[PipelineReport]:
+    def process_bulk(
+        self,
+        input_paths: list[str | Path],
+        output_dir: str | Path,
+        continue_on_error: bool = False,
+    ) -> list[PipelineReport]:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         reports = []
@@ -224,11 +288,39 @@ class BeyondColorPipeline:
             out_path = output_dir / in_path.name
             print(f"\n[{i+1}/{len(input_paths)}] {in_path.name}")
             try:
-                report = self.process_pdf(in_path, out_path)
+                if in_path.suffix.lower() == ".pdf":
+                    report = self.process_pdf(in_path, out_path)
+                elif in_path.suffix.lower() in IMAGE_SUFFIXES:
+                    report = self.process_image(in_path, out_path)
+                else:
+                    print("  SKIP: unsupported file type")
+                    continue
                 reports.append(report)
             except Exception as e:
+                if not continue_on_error:
+                    raise
                 print(f"  ERROR: {e}")
         return reports
+
+    def process_test_suite(
+        self,
+        input_dir: str | Path,
+        output_dir: str | Path,
+        compilation_path: str | Path | None = None,
+    ) -> tuple[list[PipelineReport], Path]:
+        test_paths = discover_test_images(input_dir)
+        if not test_paths:
+            raise ValueError(f"No test images found in {input_dir}")
+        reports = self.process_bulk(test_paths, output_dir)
+        output_paths = [
+            Path(report.output_path)
+            for report in reports
+            if Path(report.output_path).exists()
+        ]
+        return reports, create_contact_sheet(
+            output_paths,
+            compilation_path or Path(output_dir) / "test_compilation.png",
+        )
 
     def _process_figure(
         self,
@@ -238,35 +330,49 @@ class BeyondColorPipeline:
         source: str = "unknown",
     ) -> tuple[Image.Image, list[FigureInfo], int]:
 
-        audit_before = audit_image_contrast(figure_img, sample_count=150)
+        audit_before = audit_image_contrast(figure_img)
 
-        processed = apply_double_coding(
+        coding = apply_double_coding_with_report(
             figure_img,
             opacity=self.pattern_opacity,
         )
+        processed = coding.image
 
-        audit_after = audit_image_contrast(processed, sample_count=150)
+        audit_after = audit_image_contrast(processed)
 
         fig_info = FigureInfo(
-            page=page, bbox=bbox, figure_source=source,
-            segments_found=1,
-            patterns_applied=["pixel_double_coding"],
+            page=page, bbox=bbox, figure_source=source, chart_kind=coding.chart_kind,
+            segments_found=len(coding.segments),
+            patterns_applied=sorted({segment.pattern for segment in coding.segments}),
             contrast_before=round(audit_before.mean_ratio, 2),
             contrast_after=round(audit_after.mean_ratio, 2),
             violation_before=not audit_before.overall_pass,
             violation_after=not audit_after.overall_pass,
-            segments=[],
+            segments=[
+                SegmentInfo(
+                    color=segment.color,
+                    pattern=segment.pattern,
+                    area_px=segment.area_px,
+                    iou=None,
+                )
+                for segment in coding.segments
+            ],
         )
-        return processed, [fig_info], 1
+        return processed, [fig_info], len(coding.segments)
 
 
-_default_pipeline: BeyondColorPipeline | None = None
+def _compliance_score(figures: list[FigureInfo]) -> float:
+    if not figures:
+        return 100.0
+    passing = sum(1 for figure in figures if not figure.violation_after)
+    return 100.0 * passing / len(figures)
+
 
 def _get_pipeline(**kwargs) -> BeyondColorPipeline:
-    global _default_pipeline
-    if _default_pipeline is None:
-        _default_pipeline = BeyondColorPipeline(**kwargs)
-    return _default_pipeline
+    # Pixel-mode configuration is cheap to create and must honour the
+    # arguments of each public call instead of leaking opacity/layout state
+    # from an earlier request.
+    return BeyondColorPipeline(**kwargs)
 
 def process_image(input_path: str, output_path: str, **kwargs) -> PipelineReport:
     return _get_pipeline(**kwargs).process_image(input_path, output_path)
@@ -274,34 +380,71 @@ def process_image(input_path: str, output_path: str, **kwargs) -> PipelineReport
 def process_pdf(input_path: str, output_path: str, **kwargs) -> PipelineReport:
     return _get_pipeline(**kwargs).process_pdf(input_path, output_path)
 
-def process_bulk(input_paths: list[str], output_dir: str, **kwargs) -> list[PipelineReport]:
-    return _get_pipeline(**kwargs).process_bulk(input_paths, output_dir)
+def process_bulk(
+    input_paths: list[str],
+    output_dir: str,
+    continue_on_error: bool = False,
+    **kwargs,
+) -> list[PipelineReport]:
+    return _get_pipeline(**kwargs).process_bulk(
+        input_paths,
+        output_dir,
+        continue_on_error=continue_on_error,
+    )
+
+
+def process_test_suite(
+    input_dir: str | Path,
+    output_dir: str | Path,
+    compilation_path: str | Path | None = None,
+    **kwargs,
+) -> tuple[list[PipelineReport], Path]:
+    return _get_pipeline(**kwargs).process_test_suite(
+        input_dir,
+        output_dir,
+        compilation_path,
+    )
 
 
 def _supported_image_extensions() -> set[str]:
-    
-    from PIL import Image
-
-    Image.init()
-    exts = set(Image.registered_extensions().keys())
-
-    exts -= {".pdf"}
-    return exts
+    return set(IMAGE_SUFFIXES)
 
 
 if __name__ == "__main__":
     import sys
+    requested_input = Path(sys.argv[1]) if len(sys.argv) >= 2 else None
+    missing_test_alias = (
+        requested_input is not None
+        and not requested_input.exists()
+        and TEST_IMAGE_STEM.fullmatch(requested_input.stem) is not None
+    )
+    if len(sys.argv) == 1 or sys.argv[1] == "--test-suite" or missing_test_alias:
+        if missing_test_alias:
+            print(
+                f"[BeyondColor] {requested_input.name} is absent; "
+                "processing all available test images instead."
+            )
+        output_dir = (
+            Path(sys.argv[2])
+            if len(sys.argv) >= 3 and sys.argv[1] == "--test-suite"
+            else TEST_RESULTS_DIR
+        )
+        reports, contact_sheet = process_test_suite(PROJECT_DIR, output_dir)
+        print(json.dumps({"total": len(reports), "contact_sheet": str(contact_sheet)}, indent=2))
+        sys.exit(0)
+
     if len(sys.argv) < 3:
-        print("Usage: python pipeline.py <input> <output>")
+        print("Usage: python pipeline_pixel.py <input> <output>")
+        print("   or: python pipeline_pixel.py --test-suite [output_dir]")
         sys.exit(1)
 
     inp = Path(sys.argv[1])
     out = Path(sys.argv[2])
 
     if inp.is_dir():
-        pdfs = list(inp.glob("*.pdf"))
+        paths = [path for path in inp.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES | {".pdf"}]
         pipeline = BeyondColorPipeline()
-        reports = pipeline.process_bulk(pdfs, out)
+        reports = pipeline.process_bulk(paths, out)
         print(json.dumps({"total": len(reports)}, indent=2))
     elif inp.suffix.lower() == ".pdf":
         report = process_pdf(str(inp), str(out))

@@ -32,7 +32,7 @@ router = APIRouter(tags=["BeyondColor"])
 )
 async def process_image_endpoint(
     file:            UploadFile = File(...),
-    pattern_opacity: int = Form(155, ge=50, le=255),
+    pattern_opacity: int = Form(210, ge=50, le=255),
     return_report:   bool = Form(False),
 ):
 
@@ -71,7 +71,7 @@ async def process_image_endpoint(
 )
 async def process_pdf_endpoint(
     file:            UploadFile = File(...),
-    pattern_opacity: int = Form(155),
+    pattern_opacity: int = Form(210),
     return_report:   bool = Form(False),
 ):
     
