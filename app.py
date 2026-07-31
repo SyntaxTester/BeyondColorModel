@@ -10,7 +10,7 @@ from PIL.PngImagePlugin import PngInfo
 from image_provenance import PROCESSING_MARKER, PROCESSING_VERSION
 from pixel_segmenter import apply_double_coding
 
-OPACITY_MIN = 50
+OPACITY_MIN = 0
 OPACITY_MAX = 100
 PREVIEW_WIDTH = 560
 
