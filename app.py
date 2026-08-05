@@ -15,7 +15,7 @@ OPACITY_MAX = 100
 PREVIEW_WIDTH = 560
 
 
-st.set_page_config(page_title="BeyondColor", page_icon="BC", layout="wide")
+st.set_page_config(page_title="BeyondColor", page_icon="🎨", layout="wide")
 st.title("BeyondColor - тест разметки")
 st.caption("Загрузите один или несколько графиков. Слева - оригинал, справа - размеченная версия, гуд лак")
 
@@ -110,7 +110,7 @@ def _viewer(base, low, high, fname, key):
         ("__FNAME__", fname),
     ]:
         html = html.replace(token, value)
-    components.html(html, height=round(h * PREVIEW_WIDTH / max(w, 1) * 0.52) + 190)
+    components.html(html, height=h + 210)
 
 
 files = st.file_uploader(
@@ -134,7 +134,7 @@ for i, f in enumerate(files):
         continue
 
     if already:
-        st.error("Этот файл уже обработан. Загрузите исходное изображение, чтобы не наложить паттерны второй раз")
+        st.error("Этот файл уже обработан. Загрузите исходное изображение, чтобы не наложить паттерны второй раз.")
         continue
 
     _viewer(base, low, high, "beyondcolor_" + f.name.rsplit(".", 1)[0] + ".png", str(i))
