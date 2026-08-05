@@ -12,7 +12,7 @@ from pixel_segmenter import apply_double_coding
 
 OPACITY_MIN = 50
 OPACITY_MAX = 100
-PREVIEW_WIDTH = 560
+PREVIEW_WIDTH = 900
 
 
 st.set_page_config(page_title="BeyondColor", page_icon="🎨", layout="wide")
@@ -55,7 +55,8 @@ TEMPLATE = """
  .bcbtn{display:inline-block;margin-top:12px;padding:7px 16px;border:1px solid #4a4f5c;
         border-radius:8px;color:#fafafa;text-decoration:none;font-size:14px;background:#262730}
  .bcbtn:hover{border-color:#ff4b4b;color:#ff4b4b}
- img,canvas{width:100%;display:block;border-radius:4px}
+ img,canvas{width:100%;max-width:__DW__px;display:block;border-radius:4px}
+ .bccol{max-width:__DW__px}
 </style>
 <div class="bcwrap">
   <div class="bclab">Прозрачность узора: <span class="bcval" id="VAL_ID">100</span></div>
@@ -74,6 +75,13 @@ TEMPLATE = """
 </div>
 <script>
 (function(){
+ function fit(){
+   var h=document.body.scrollHeight;
+   window.parent.postMessage({type:"streamlit:setFrameHeight",height:h+12},"*");
+ }
+ window.addEventListener("load",fit);
+ window.addEventListener("resize",fit);
+ setInterval(fit,700);
  var rng=document.getElementById("RNG_ID"),val=document.getElementById("VAL_ID"),
      cnv=document.getElementById("CNV_ID"),dl=document.getElementById("DL_ID"),
      ctx=cnv.getContext("2d"),lo=new Image(),hi=new Image(),ready=0;
@@ -86,7 +94,7 @@ TEMPLATE = """
    ctx.globalAlpha=1;
    val.textContent=rng.value;
  }
- function done(){ready++;draw();}
+ function done(){ready++;draw();fit();}
  lo.onload=done;hi.onload=done;
  lo.src="__LOW__";hi.src="__HIGH__";
  rng.addEventListener("input",draw);
@@ -100,17 +108,19 @@ def _viewer(base, low, high, fname, key):
     b_url, w, h = _to_url(base, PREVIEW_WIDTH)
     l_url, _, _ = _to_url(low, PREVIEW_WIDTH)
     h_url, _, _ = _to_url(high, PREVIEW_WIDTH)
+    disp_w = min(int(round(w * 1.6)), PREVIEW_WIDTH)
+    disp_h = int(round(h * disp_w / max(w, 1)))
     html = TEMPLATE
     for token, value in [
         ("VAL_ID", "v" + key), ("RNG_ID", "r" + key),
         ("CNV_ID", "c" + key), ("DL_ID", "d" + key),
         ("__MIN__", str(OPACITY_MIN)), ("__MAX__", str(OPACITY_MAX)),
-        ("__W__", str(w)), ("__H__", str(h)),
+        ("__W__", str(w)), ("__H__", str(h)), ("__DW__", str(disp_w)),
         ("__BASE__", b_url), ("__LOW__", l_url), ("__HIGH__", h_url),
         ("__FNAME__", fname),
     ]:
         html = html.replace(token, value)
-    components.html(html, height=h + 210)
+    components.html(html, height=disp_h + 210)
 
 
 files = st.file_uploader(
