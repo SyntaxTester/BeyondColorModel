@@ -1,13 +1,13 @@
 {
   "gen_dark.png": {
-    "thin_hit": 259,
+    "thin_hit": 258,
     "peaks_covered_pct": 100,
     "markers": 8
   },
   "gen_native.png": {
-    "thin_hit": 4642,
+    "thin_hit": 4634,
     "peaks_covered_pct": 88,
-    "markers": 164
+    "markers": 166
   },
   "gen_nolegend8.png": {
     "thin_hit": 7510,
@@ -15,14 +15,14 @@
     "markers": 284
   },
   "gen_similar.png": {
-    "thin_hit": 3053,
-    "peaks_covered_pct": 35,
-    "markers": 98
+    "thin_hit": 5742,
+    "peaks_covered_pct": 70,
+    "markers": 222
   },
   "gen_thick.png": {
-    "thin_hit": 3807,
+    "thin_hit": 3887,
     "peaks_covered_pct": 100,
-    "markers": 104
+    "markers": 106
   },
   "bars_550.png": {
     "thin_hit": 505,

@@ -187,7 +187,11 @@ def _merge_duplicate_legend_swatch_handles(handles: list[dict]) -> list[dict]:
             ref_right = ref_left + int(reference["len"])
             vertical_tolerance = max(2, (int(handle["h"]) + int(reference["h"])) // 2)
             overlaps = max(left, ref_left) <= min(right, ref_right) + 2
-            if abs(int(handle["y"]) - int(reference["y"])) <= vertical_tolerance and overlaps:
+            colour_gap = float(np.linalg.norm(
+                np.asarray(handle["rgb"], dtype=np.float32)
+                - np.asarray(reference["rgb"], dtype=np.float32)))
+            if (abs(int(handle["y"]) - int(reference["y"])) <= vertical_tolerance
+                    and overlaps and colour_gap <= 60.0):
                 group.append(handle)
                 break
         else:
@@ -200,7 +204,10 @@ def _merge_duplicate_legend_swatch_handles(handles: list[dict]) -> list[dict]:
                    - min(int(item["x"]) for item in group),
             "h": max(int(item["h"]) for item in group),
             "y": round(sum(int(item["y"]) for item in group) / len(group)),
-            "rgb": tuple(np.rint(np.mean([item["rgb"] for item in group], axis=0)).astype(int)),
+            "rgb": tuple(int(v) for v in max(
+                group,
+                key=lambda item: int(max(item["rgb"])) - int(min(item["rgb"])),
+            )["rgb"]),
         }
         for group in merged
     ]
@@ -1077,6 +1084,7 @@ def _cluster_line_colors(arr: np.ndarray, lines_mask: np.ndarray,
         return []
 
     crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.5)
+    cv2.setRNGSeed(0)
     _, labels, centers = cv2.kmeans(px, max_k, None, crit, 10, cv2.KMEANS_PP_CENTERS)
 
     counts = np.bincount(labels.flatten(), minlength=max_k)
@@ -1222,7 +1230,9 @@ def _find_legend_handles_for_colors(
     import cv2
 
     height, width = arr.shape[:2]
-    dark_text = arr.max(axis=2) <= 145
+    channel_max = arr.max(axis=2).astype(np.int16)
+    channel_min = arr.min(axis=2).astype(np.int16)
+    dark_text = (channel_max <= 145) & ((channel_max - channel_min) <= 40)
     handles: list[dict] = []
 
     for line_color in line_colors:
@@ -1240,11 +1250,13 @@ def _find_legend_handles_for_colors(
                 3 <= handle_width <= 70
                 and 1 <= handle_height <= 18
                 and area >= 3
+                and area >= 2 * handle_width
             ):
                 continue
 
-            y1 = max(0, y - max(5, handle_height))
-            y2 = min(height, y + handle_height + max(5, handle_height))
+            center_y = y + handle_height // 2
+            y1 = max(0, center_y - 4)
+            y2 = min(height, center_y + 5)
             x1 = min(width, x + handle_width)
             x2 = min(width, x1 + max(28, handle_width * 3))
             label_pixels = int(dark_text[y1:y2, x1:x2].sum())
@@ -1440,11 +1452,13 @@ def _place_markers_on_lines(
         return any(abs(cx - qx) < keep_out and abs(cy - qy) < keep_out
                    for qx, qy, _, _ in crossings)
 
-    foreign_px = []
-    for ci_ in range(len(centers)):
-        m = (np.abs(arr.astype(np.int32) - centers[ci_].astype(np.int32)
-                    ).max(2) < 30)
-        foreign_px.append(m)
+    _fg_diff = np.stack([
+        np.abs(arr.astype(np.int32) - centers[ci_].astype(np.int32)).max(2)
+        for ci_ in range(len(centers))
+    ])
+    _fg_near = _fg_diff.argmin(0)
+    _fg_in = _fg_diff.min(0) < 30
+    foreign_px = [(_fg_near == ci_) & _fg_in for ci_ in range(len(centers))]
 
     def _covers_foreign(ci, cx, cy, size, limit=6):
         r = size // 2

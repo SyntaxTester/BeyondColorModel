@@ -190,7 +190,7 @@ def main() -> int:
         cov = 100 * r["peaks_covered"] // r["peaks"] if r["peaks"] else -1
         rows.append((p.name, r, cov))
 
-    print(f"{'график':22} {'Мп':>5} {'тонкие':>7} {'пики':>6} {'покрыто':>9} {'маркеров':>9} {'сек':>6}")
+    print(f"{'график':22} {'Мп':>5} {'тонкие':>7} {'пики':>6} {'покрыто':>9} {'отрисовок':>9} {'сек':>6}")
     for name, r, cov in rows:
         covs = f"{cov}%" if cov >= 0 else "-"
         print(f"{name:22} {r['px']/1e6:5.2f} {r['thin_hit']:7d} {r['peaks']:6d} {covs:>9} {r['markers']:9d} {r['sec']:6.2f}")
@@ -240,11 +240,11 @@ def main() -> int:
                 fails.append(f"паттерны: в наборе повтор ({cur['total']} слотов, {cur['distinct']} разных)")
             continue
         if cur["thin_hit"] > max(old["thin_hit"] + 20, old["thin_hit"] * 1.5):
-            fails.append(f"{name}: текст перекрыт {old['text_hit']} -> {cur['thin_hit']} px")
+            fails.append(f"{name}: тонких структур закрашено {old['thin_hit']} -> {cur['thin_hit']} px")
         if old["peaks_covered_pct"] >= 0 and cur["peaks_covered_pct"] < old["peaks_covered_pct"] - 5:
             fails.append(f"{name}: покрытие пиков {old['peaks_covered_pct']}% -> {cur['peaks_covered_pct']}%")
         if cur["markers"] < old["markers"] * 0.8:
-            fails.append(f"{name}: маркеров {old['markers']} -> {cur['markers']}")
+            fails.append(f"{name}: отрисовок {old['markers']} -> {cur['markers']}")
 
     if fails:
         print("\nРЕГРЕСС:")
