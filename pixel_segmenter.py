@@ -1923,6 +1923,8 @@ def _pie_region_mask(colorful: np.ndarray) -> np.ndarray:
                 continue
             points = np.vstack([contour.reshape(-1, 2) for contour in contours])
             (center_x, center_y), radius = cv2.minEnclosingCircle(points)
+            if radius <= 0 or area / (np.pi * radius * radius) < 0.75:
+                continue
             cv2.circle(
                 pie_regions,
                 (round(center_x), round(center_y)),
