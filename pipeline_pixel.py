@@ -228,7 +228,9 @@ class BeyondColorPipeline:
             mat  = fitz.Matrix(self.page_dpi / 72, self.page_dpi / 72)
             pix  = page.get_pixmap(matrix=mat, alpha=False)
             page_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            figure_blocks = detector.detect(page_img, min_area=self.min_figure_area)
+            zoom = self.page_dpi / 72
+            words = [(w[0] * zoom, w[1] * zoom, w[2] * zoom, w[3] * zoom) for w in page.get_text("words")]
+            figure_blocks = detector.detect(page_img, min_area=self.min_figure_area, dpi=self.page_dpi, text_boxes=words)
             print(f"{len(figure_blocks)} figure(s)")
 
             for fig_block in figure_blocks:

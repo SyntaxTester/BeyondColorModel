@@ -10,9 +10,10 @@ from PIL.PngImagePlugin import PngInfo
 from image_provenance import PROCESSING_MARKER, PROCESSING_VERSION
 from pixel_segmenter import apply_double_coding
 
-OPACITY_MIN = 50
+OPACITY_MIN = 0
 OPACITY_MAX = 100
 PREVIEW_WIDTH = 900
+MAX_SIDE = 2000
 
 
 st.set_page_config(page_title="BeyondColor", page_icon="🎨", layout="wide")
@@ -28,6 +29,9 @@ def _prepare(raw):
         img = source.convert("RGB")
     if already:
         return True, None, None, None
+    if max(img.size) > MAX_SIDE:
+        scale = MAX_SIDE / max(img.size)
+        img = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))), Image.LANCZOS)
     base = np.asarray(img, dtype=np.uint8)
     low = np.asarray(apply_double_coding(img, opacity=OPACITY_MIN), dtype=np.uint8)
     high = np.asarray(apply_double_coding(img, opacity=OPACITY_MAX), dtype=np.uint8)
@@ -159,4 +163,4 @@ for i, f in enumerate(files):
         file_name="beyondcolor_" + f.name.rsplit(".", 1)[0] + ".png",
         mime="image/png",
         key=f.name,
-    )#
+    )

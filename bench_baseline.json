@@ -1,8 +1,8 @@
 {
   "gen_dark.png": {
-    "thin_hit": 258,
-    "peaks_covered_pct": 100,
-    "markers": 8
+    "thin_hit": 4377,
+    "peaks_covered_pct": 85,
+    "markers": 184
   },
   "gen_native.png": {
     "thin_hit": 4634,
@@ -50,9 +50,14 @@
     "markers": 0
   },
   "test_chart5.png": {
-    "thin_hit": 1323,
+    "thin_hit": 788,
     "peaks_covered_pct": -1,
     "markers": 0
+  },
+  "test_chart7.png": {
+    "thin_hit": 1181,
+    "peaks_covered_pct": 78,
+    "markers": 48
   },
   "_legibility": {
     "0:dots": {

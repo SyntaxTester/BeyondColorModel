@@ -14,24 +14,22 @@ class _PatternSpec:
 
 
 _PATTERN_LIBRARY = [
-    _PatternSpec("lines", 0.0),
-    _PatternSpec("dots", 0.0),
     _PatternSpec("dashed", 45.0),
-    _PatternSpec("lines", 90.0),
-    # A sine wave and a zigzag collapse into the same chevron shape at small
-    # raster sizes.  Crosshatch remains visually distinct from zigzag.
-    _PatternSpec("crosshatch", 22.5),
-    _PatternSpec("zigzag", 0.0),
-    _PatternSpec("lines", 45.0),
-    _PatternSpec("dots", 0.0, 1.35),
-    _PatternSpec("dashed", -45.0),
-    _PatternSpec("lines", -45.0),
-    _PatternSpec("waves", 90.0),
+    _PatternSpec("grid", 0.0),
+    _PatternSpec("waves", 0.0),
     _PatternSpec("zigzag", 90.0),
-    _PatternSpec("crosshatch", 22.5),
-    _PatternSpec("grid", 45.0),
+    _PatternSpec("crosshatch", 0.0),
     _PatternSpec("bricks", 0.0),
+    _PatternSpec("dots", 0.0, 1.8),
     _PatternSpec("lines", 22.5),
+    _PatternSpec("dashed", -45.0),
+    _PatternSpec("waves", 90.0),
+    _PatternSpec("zigzag", 0.0),
+    _PatternSpec("grid", 45.0),
+    _PatternSpec("bricks", 90.0),
+    _PatternSpec("lines", 67.5),
+    _PatternSpec("crosshatch", 22.5),
+    _PatternSpec("lines", -22.5),
 ]
 
 # Keep the deploy palette as the first-choice palette for up to eight data
@@ -70,7 +68,11 @@ _DEPLOY_PATTERN_DISTANCE = [
 # only makes the raster text visibly soft.  The target lets larger markers use
 # a gentler scale rather than always hitting that cap.
 _LEGEND_SWATCH_TARGET_SIZE = 14
-_MARKER_SHAPES = ["circle", "square", "triangle", "diamond", "cross", "star"]
+_MARKER_BASE_SHAPES = ["circle", "square", "triangle", "diamond", "cross", "x", "triangle_down", "star"]
+_MARKER_SHAPES = _MARKER_BASE_SHAPES + [
+    "circle_open", "square_open", "triangle_open", "diamond_open",
+    "triangle_down_open", "star_open", "cross_open", "x_open",
+]
 
 _CVD_MATRICES = {
     "deuteranopia": np.array([[0.367322, 0.860646, -0.227968],
@@ -277,9 +279,12 @@ def _merge_adjacent_bar_shades(series: list[_PixelSeries]) -> list[_PixelSeries]
         while other_index < len(merged):
             left = merged[candidate_index]
             right = merged[other_index]
+            left_saturation = (float(left.mean_rgb.max()) - float(left.mean_rgb.min())) / max(float(left.mean_rgb.max()), 1.0)
+            right_saturation = (float(right.mean_rgb.max()) - float(right.mean_rgb.min())) / max(float(right.mean_rgb.max()), 1.0)
             should_merge = (
                 _hue_distance(left.mean_rgb, right.mean_rgb) <= 8
                 and _lab_distance(left.mean_rgb, right.mean_rgb) <= 92.0
+                and abs(left_saturation - right_saturation) <= 0.3
                 and _masks_are_adjacent(left.masks, right.masks)
             )
             if not should_merge:
@@ -439,6 +444,15 @@ def _assign_patterns_by_color(series: list[_PixelSeries]) -> None:
             candidate.spacing_scale = spec.spacing_scale
 
 
+def _is_vivid_region(arr: np.ndarray, mask: np.ndarray, foreign: np.ndarray, box: tuple) -> bool:
+    rgb = np.median(arr[mask], axis=0).astype(np.float32)
+    brightest = float(rgb.max())
+    if brightest < 100 or (brightest - float(rgb.min())) / brightest < 0.25:
+        return False
+    x, y, width, height = box
+    return float(foreign[y:y + height, x:x + width].mean()) <= 0.02
+
+
 def _build_color_series(
     arr: np.ndarray,
     valid: np.ndarray,
@@ -489,7 +503,10 @@ def _build_color_series(
                 continue
             if width * height > h_img * w_img * 0.75 and area > h_img * w_img * 0.05:
                 continue
-            if width > w_img * 0.55 and height > h_img * 0.30:
+            if width > w_img * 0.55 and height > h_img * 0.30 and not _is_vivid_region(
+                arr, labels == label_id, valid & (np.abs(hue_bins.astype(np.int16) - int(hue_bin)) > 2),
+                (x, y, width, height),
+            ):
                 continue
             if (
                 not is_pie
@@ -1052,6 +1069,14 @@ def _draw_marker(canvas: np.ndarray, cx: int, cy: int, shape: str,
     import cv2
     r = size // 2
     c = tuple(int(v) for v in color)
+    if shape.endswith("_open"):
+        base = shape[:-5]
+        _draw_marker(canvas, cx, cy, base, size + 2, color, outline)
+        hole = max(3, (size + 2) // 2)
+        if base in ("cross", "x"):
+            hole = max(1, hole // 2)
+        _draw_marker(canvas, cx, cy, base, hole, (255, 255, 255), None)
+        return
     if outline is not None:
         _draw_marker(canvas, cx, cy, shape, size + 3, outline, None)
 
@@ -1069,10 +1094,22 @@ def _draw_marker(canvas: np.ndarray, cx: int, cy: int, shape: str,
         t = max(1, r // 2)
         cv2.rectangle(canvas, (cx - r, cy - t), (cx + r, cy + t), c, -1)
         cv2.rectangle(canvas, (cx - t, cy - r), (cx + t, cy + r), c, -1)
-    elif shape == "star":
-        cv2.circle(canvas, (cx, cy), r, c, -1)
+    elif shape == "x":
         t = max(1, r // 3)
-        cv2.rectangle(canvas, (cx - r - 1, cy - t), (cx + r + 1, cy + t), c, -1)
+        arm = np.array([[-t, -r], [t, -r], [t, -t], [r, -t], [r, t], [t, t],
+                        [t, r], [-t, r], [-t, t], [-r, t], [-r, -t], [-t, -t]], np.float64)
+        rot = np.array([[0.7071, -0.7071], [0.7071, 0.7071]]) * 1.3
+        pts = arm @ rot.T + np.array([cx, cy])
+        cv2.fillPoly(canvas, [np.round(pts).astype(np.int32)], c)
+    elif shape == "triangle_down":
+        pts = np.array([[cx, cy + r], [cx - r, cy - r], [cx + r, cy - r]], np.int32)
+        cv2.fillPoly(canvas, [pts], c)
+    elif shape == "star":
+        outer = r + 1
+        angles = np.deg2rad(np.arange(10) * 36.0 - 90.0)
+        radii = np.where(np.arange(10) % 2 == 0, outer, outer * 0.45)
+        pts = np.stack([cx + radii * np.cos(angles), cy + radii * np.sin(angles)], 1)
+        cv2.fillPoly(canvas, [np.round(pts).astype(np.int32)], c)
 
 
 def _cluster_line_colors(arr: np.ndarray, lines_mask: np.ndarray,
@@ -1566,6 +1603,27 @@ def _is_line_chart(valid: np.ndarray, thin: np.ndarray, min_area: int = 150) -> 
     return (thin_area / total) > 0.05
 
 
+def _enclosed_text_holes(valid: np.ndarray, protected: np.ndarray) -> np.ndarray:
+    import cv2
+
+    height, width = valid.shape
+    count, labels, stats, _ = cv2.connectedComponentsWithStats((~valid).astype(np.uint8), connectivity=4)
+    holes = np.zeros_like(valid, dtype=bool)
+    for label_id in range(1, count):
+        x, y, box_width, box_height, _ = stats[label_id]
+        if x == 0 or y == 0 or x + box_width >= width or y + box_height >= height:
+            continue
+        hole = labels == label_id
+        if protected[hole].mean() >= 0.5:
+            holes |= hole
+    return holes
+
+
+def _is_line_chart_without_text(valid: np.ndarray, protected: np.ndarray, legend: np.ndarray) -> bool:
+    filled = valid | _enclosed_text_holes(valid, protected)
+    return _is_line_chart(filled, _find_thin_structures(filled) & ~legend)
+
+
 def _find_legend_squares(valid: np.ndarray) -> np.ndarray:
     import cv2
 
@@ -1711,6 +1769,8 @@ def _protect_text_pixels(arr: np.ndarray) -> np.ndarray:
     channel_min = arr.min(axis=2)
     channel_max = arr.max(axis=2)
     dark_neutral = (channel_max <= 110) & ((channel_max - channel_min) <= 25)
+    if dark_neutral.mean() > 0.5:
+        dark_neutral = np.zeros_like(dark_neutral)
     # Do not protect every light pixel: pale grey data series (for example a
     # 2019 bar) would otherwise be removed before pattern detection.  Bright
     # text is handled below as compact connected components instead.
@@ -1976,12 +2036,29 @@ def _classify_chart_geometry(
     min_line_area = max(100, int(height * width * 0.00025))
     min_span = max(40, int(width * 0.14))
     line_mask = _line_component_mask(data_thin, min_line_area, min_span)
-    if line_mask.any() and _is_line_chart(line_candidates, data_thin):
+    if line_mask.any() and _is_line_chart_without_text(line_candidates, protected, legend):
         return _ChartClassification("line", line_mask, thin, legend, empty)
 
     mixed_lines = _find_mixed_chart_lines(arr, line_candidates)
     if mixed_lines.any():
         return _ChartClassification("mixed", mixed_lines, thin, legend, empty)
+
+    raw_max = arr.max(axis=2).astype(np.float32)
+    raw_delta = raw_max - arr.min(axis=2).astype(np.float32)
+    raw_valid = (
+        (raw_delta >= 25)
+        & (raw_max >= 30)
+        & (arr.min(axis=2) <= 248)
+        & (raw_delta / np.maximum(raw_max, 1.0) >= 0.12)
+    )
+    raw_candidates = (line_valid | raw_valid) & ~protected & ~edge_background
+    if raw_candidates.sum() > line_candidates.sum():
+        raw_thin = _find_thin_structures(raw_candidates)
+        raw_legend = _find_legend_squares(raw_candidates)
+        raw_data_thin = raw_thin & ~raw_legend
+        raw_line_mask = _line_component_mask(raw_data_thin, min_line_area, min_span)
+        if raw_line_mask.any() and _is_line_chart_without_text(raw_candidates, protected, raw_legend):
+            return _ChartClassification("line", raw_line_mask, raw_thin, raw_legend, empty)
 
     return _ChartClassification("diagram", empty, thin, legend, empty)
 
@@ -2024,6 +2101,71 @@ def classify_chart_kind(
     ).kind
 
 
+def _looks_like_photo(arr: np.ndarray, threshold: float = 0.87) -> bool:
+    import cv2
+
+    grey = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY).astype(np.int16)
+    content = cv2.dilate((grey < 235).astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+    if content.sum() < 500:
+        return False
+    left, up, diagonal = grey[1:, :-1], grey[:-1, 1:], grey[:-1, :-1]
+    predicted = np.where(
+        diagonal >= np.maximum(left, up),
+        np.minimum(left, up),
+        np.where(diagonal <= np.minimum(left, up), np.maximum(left, up), left + up - diagonal),
+    )
+    error = np.abs(grey[1:, 1:] - predicted)[content[1:, 1:]]
+    texture = int(((error >= 6) & (error < 30)).sum())
+    edges = int((error >= 30).sum())
+    return texture / max(texture + edges, 1) >= threshold
+
+
+def _colorful_pixels(arr: np.ndarray) -> np.ndarray:
+    rgb = arr.astype(np.float32)
+    brightest = rgb.max(axis=2)
+    delta = brightest - rgb.min(axis=2)
+    return (delta >= 25) & (delta / np.maximum(brightest, 1.0) >= 0.12)
+
+
+def _is_single_hue(arr: np.ndarray, colorful: np.ndarray, spread_degrees: float = 30.0) -> bool:
+    import cv2
+
+    if colorful.sum() < 30:
+        return True
+    hue = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)[:, :, 0][colorful].astype(np.float32) * 2.0
+    angles = np.deg2rad(hue)
+    center = np.arctan2(np.sin(angles).mean(), np.cos(angles).mean())
+    distance = np.abs(np.rad2deg(np.angle(np.exp(1j * (angles - center)))))
+    return float((distance > spread_degrees).mean()) <= 0.01
+
+
+def _has_colorbar(arr: np.ndarray) -> bool:
+    import cv2
+
+    rgb = arr.astype(np.int16)
+    spread = rgb.max(axis=2) - rgb.min(axis=2)
+    colored = ((spread >= 25) & (rgb.max(axis=2) >= 30)).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(colored, connectivity=4)
+    for label_id in range(1, count):
+        x, y, width, height, area = stats[label_id]
+        long_side, short_side = max(width, height), min(width, height)
+        if long_side < 60 or short_side < 4 or long_side < 6 * short_side:
+            continue
+        if area < 0.7 * width * height:
+            continue
+        strip = arr[y:y + height, x:x + width].astype(np.float32)
+        profile = np.median(strip, axis=1 if height > width else 0)
+        profile = cv2.medianBlur(profile.astype(np.uint8).reshape(-1, 1, 3), 5).reshape(-1, 3).astype(np.float32)
+        trim = max(2, len(profile) // 10)
+        profile = profile[trim:-trim]
+        steps = np.abs(np.diff(profile, axis=0)).max(axis=1)
+        distinct = len(np.unique((profile // 12).astype(np.int32), axis=0))
+        change = float(np.abs(profile[-1] - profile[0]).max())
+        if distinct >= 12 and change >= 100 and float(np.percentile(steps, 95)) <= 30:
+            return True
+    return False
+
+
 def apply_double_coding_with_report(
     image: Image.Image,
     opacity: int = 100,
@@ -2033,6 +2175,8 @@ def apply_double_coding_with_report(
     import cv2
 
     arr = np.array(image.convert("RGB"))
+    if _looks_like_photo(arr):
+        return DoubleCodingResult(image=Image.fromarray(arr), chart_kind="photo", segments=())
     arr_for_classification = _smooth_shadows(arr) if smooth_shadows else arr
 
     hsv = cv2.cvtColor(arr_for_classification, cv2.COLOR_RGB2HSV)
@@ -2117,6 +2261,10 @@ def apply_double_coding_with_report(
         for candidate in sorted(series, key=lambda item: -item.area)
     )
     segments = area_segments + line_segments
+    if _has_colorbar(arr) or (
+        len(segments) <= 1 and _is_single_hue(arr, _colorful_pixels(arr) & ~protected)
+    ):
+        return DoubleCodingResult(image=Image.fromarray(arr), chart_kind=chart_kind, segments=())
     return DoubleCodingResult(
         image=Image.fromarray(result.astype(np.uint8)),
         chart_kind=chart_kind,

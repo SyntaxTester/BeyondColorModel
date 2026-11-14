@@ -30,6 +30,7 @@ FIXTURES = [
     "test_chart3.png",
     "test_chart4.png",
     "test_chart5.png",
+    "test_chart7.png",
 ]
 
 
