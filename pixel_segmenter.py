@@ -447,6 +447,14 @@ def _assign_patterns_by_color(series: list[_PixelSeries]) -> None:
             candidate.spacing_scale = spec.spacing_scale
 
 
+def _is_edge_band(x: int, y: int, width: int, height: int, w_img: int, h_img: int) -> bool:
+    margin_y = max(6, int(h_img * 0.03))
+    margin_x = max(6, int(w_img * 0.03))
+    horizontal = width >= 0.9 * w_img and height <= 0.15 * h_img and (y <= margin_y or y + height >= h_img - margin_y)
+    vertical = height >= 0.9 * h_img and width <= 0.15 * w_img and (x <= margin_x or x + width >= w_img - margin_x)
+    return horizontal or vertical
+
+
 def _is_vivid_region(arr: np.ndarray, mask: np.ndarray, foreign: np.ndarray, box: tuple) -> bool:
     rgb = np.median(arr[mask], axis=0).astype(np.float32)
     brightest = float(rgb.max())
@@ -505,6 +513,8 @@ def _build_color_series(
             if not is_pie and min(width, height) <= 2:
                 continue
             if width * height > h_img * w_img * 0.75 and area > h_img * w_img * 0.05:
+                continue
+            if not is_pie and _is_edge_band(x, y, width, height, w_img, h_img):
                 continue
             if width > w_img * 0.55 and height > h_img * 0.30 and not _is_vivid_region(
                 arr, labels == label_id, valid & (np.abs(hue_bins.astype(np.int16) - int(hue_bin)) > 2),
@@ -1273,6 +1283,8 @@ def _find_legend_handles_for_colors(
     channel_max = arr.max(axis=2).astype(np.int16)
     channel_min = arr.min(axis=2).astype(np.int16)
     dark_text = (channel_max <= 145) & ((channel_max - channel_min) <= 40)
+    if float(np.mean(_background_color(arr))) < 100:
+        dark_text = (channel_min >= 150) & ((channel_max - channel_min) <= 40)
     handles: list[dict] = []
 
     for line_color in line_colors:
@@ -1303,14 +1315,16 @@ def _find_legend_handles_for_colors(
             if label_pixels < 12:
                 continue
 
-            candidate = (label_pixels, int(x), int(y), int(handle_width), int(handle_height), int(area))
-            if best_candidate is None or candidate[0] > best_candidate[0]:
+            component = labels[y:y + handle_height, x:x + handle_width] == label_id
+            closeness = -int(color_distance[y:y + handle_height, x:x + handle_width][component].mean() // 8)
+            candidate = (label_pixels, int(x), int(y), int(handle_width), int(handle_height), int(area), closeness)
+            if best_candidate is None or (candidate[6], candidate[0]) > (best_candidate[6], best_candidate[0]):
                 best_candidate = candidate
 
         if best_candidate is None:
             continue
 
-        _, x, y, handle_width, handle_height, _ = best_candidate
+        _, x, y, handle_width, handle_height, _, _ = best_candidate
         handles.append(
             {
                 "x": x,
@@ -1403,6 +1417,19 @@ def _find_peaks(
     return peaks
 
 
+def _line_like_share(mask: np.ndarray) -> float:
+    import cv2
+
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    elongated = 0
+    for label_id in range(1, count):
+        _, _, width, height, area = stats[label_id]
+        long_side, short_side = max(width, height), min(width, height)
+        if long_side >= 40 or (long_side >= 12 and long_side >= 3 * short_side):
+            elongated += int(area)
+    return elongated / max(int(mask.sum()), 1)
+
+
 def _place_markers_on_lines(
     result: np.ndarray,
     lines_mask: np.ndarray,
@@ -1458,6 +1485,9 @@ def _place_markers_on_lines(
         sel_i = (assign == ci) & on_line
         m[ys[sel_i], xs[sel_i]] = True
         series_mask.append(m)
+    scattered = {ci for ci, m in enumerate(series_mask) if m.sum() >= 200 and _line_like_share(m) < 0.1}
+    for ci in scattered:
+        series_mask[ci] = np.zeros_like(series_mask[ci])
 
     line_segments = tuple(
         DoubleCodingSegment(
@@ -1510,6 +1540,8 @@ def _place_markers_on_lines(
         return foreign > own
 
     for ci, h in enumerate(handles):
+        if ci in scattered:
+            continue
         shape = _MARKER_SHAPES[ci % len(_MARKER_SHAPES)]
         fill, outline = _marker_colors(np.array(h["rgb"], dtype=np.float32))
         cx = h["x"] + h["len"] // 2
@@ -1518,7 +1550,7 @@ def _place_markers_on_lines(
 
     for ci in range(len(line_colors)):
         sel = (assign == ci) & on_line
-        if sel.sum() < 50:
+        if sel.sum() < 50 or ci in scattered:
             continue
         shape = _MARKER_SHAPES[ci % len(_MARKER_SHAPES)]
         fill, outline = _marker_colors(centers[ci])
@@ -1924,7 +1956,9 @@ def _draw_pattern(
         if family == "checker":
             columns = np.floor(proj / deploy_spacing).astype(np.int64)
             rows = np.floor(perp / deploy_spacing).astype(np.int64)
-            return ((columns + rows) % 2) == 0
+            u = ((proj % deploy_spacing) / deploy_spacing) - 0.5
+            v = ((perp % deploy_spacing) / deploy_spacing) - 0.5
+            return (((columns + rows) % 2) == 0) & (np.abs(u) < 0.4) & (np.abs(v) < 0.4)
 
     stroke_width = np.where(bold, 3.0, 2.0)
 

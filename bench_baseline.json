@@ -1,8 +1,8 @@
 {
   "gen_dark.png": {
-    "thin_hit": 4377,
-    "peaks_covered_pct": 85,
-    "markers": 184
+    "thin_hit": 4306,
+    "peaks_covered_pct": 88,
+    "markers": 190
   },
   "gen_native.png": {
     "thin_hit": 4634,
@@ -10,7 +10,7 @@
     "markers": 166
   },
   "gen_nolegend8.png": {
-    "thin_hit": 7510,
+    "thin_hit": 7667,
     "peaks_covered_pct": 74,
     "markers": 284
   },
@@ -25,17 +25,17 @@
     "markers": 106
   },
   "bars_550.png": {
-    "thin_hit": 505,
+    "thin_hit": 406,
     "peaks_covered_pct": -1,
     "markers": 0
   },
   "test_chart.png": {
-    "thin_hit": 1304,
+    "thin_hit": 984,
     "peaks_covered_pct": -1,
     "markers": 0
   },
   "test_chart2.png": {
-    "thin_hit": 326,
+    "thin_hit": 318,
     "peaks_covered_pct": -1,
     "markers": 0
   },
@@ -45,19 +45,19 @@
     "markers": 0
   },
   "test_chart4.png": {
-    "thin_hit": 596,
+    "thin_hit": 560,
     "peaks_covered_pct": -1,
     "markers": 0
   },
   "test_chart5.png": {
-    "thin_hit": 788,
+    "thin_hit": 637,
     "peaks_covered_pct": -1,
     "markers": 0
   },
   "test_chart7.png": {
-    "thin_hit": 1181,
-    "peaks_covered_pct": 78,
-    "markers": 48
+    "thin_hit": 1209,
+    "peaks_covered_pct": 82,
+    "markers": 54
   },
   "_legibility": {
     "0:dots": {
@@ -96,9 +96,9 @@
       "elems": 121
     },
     "7:checker": {
-      "density": 0.4999,
-      "elem_px": 537,
-      "elems": 9
+      "density": 0.3199,
+      "elem_px": 92,
+      "elems": 67
     }
   },
   "_patterns": {
