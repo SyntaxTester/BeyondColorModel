@@ -2,6 +2,9 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
+import hashlib
+import threading
 import numpy as np
 from PIL import Image
 
@@ -2101,7 +2104,57 @@ def classify_chart_kind(
     ).kind
 
 
-def _looks_like_photo(arr: np.ndarray, threshold: float = 0.87) -> bool:
+_PHOTO_MODEL_DIR = Path(__file__).resolve().parent / "models"
+_PHOTO_THRESHOLD = 0.7
+_photo_lock = threading.Lock()
+_photo_state: dict = {}
+_photo_cache: dict = {}
+
+
+def _load_photo_classifier():
+    if "net" not in _photo_state:
+        try:
+            import cv2
+
+            head = np.load(_PHOTO_MODEL_DIR / "photo_head.npz")
+            _photo_state["net"] = cv2.dnn.readNetFromONNX(str(_PHOTO_MODEL_DIR / "photo_classifier.onnx"))
+            _photo_state["head"] = {key: head[key] for key in ("mean", "scale", "coef", "bias")}
+        except Exception:
+            _photo_state["net"] = None
+    return _photo_state["net"]
+
+
+def _photo_probability(arr: np.ndarray) -> float | None:
+    import cv2
+
+    small = cv2.resize(arr, (224, 224), interpolation=cv2.INTER_AREA)
+    key = hashlib.md5(small.tobytes()).hexdigest()
+    with _photo_lock:
+        if key in _photo_cache:
+            return _photo_cache[key]
+        net = _load_photo_classifier()
+        if net is None:
+            return None
+        x = (small.astype(np.float32) / 255.0 - np.array([0.485, 0.456, 0.406], np.float32)) / np.array([0.229, 0.224, 0.225], np.float32)
+        net.setInput(x.transpose(2, 0, 1)[None])
+        logits = net.forward().ravel()
+        head = _photo_state["head"]
+        z = float(((logits - head["mean"]) / head["scale"]) @ head["coef"] + head["bias"])
+        probability = 1.0 / (1.0 + np.exp(-z))
+        if len(_photo_cache) > 256:
+            _photo_cache.clear()
+        _photo_cache[key] = probability
+        return probability
+
+
+def _looks_like_photo(arr: np.ndarray) -> bool:
+    probability = _photo_probability(arr)
+    if probability is None:
+        return _looks_like_photo_by_texture(arr)
+    return probability >= _PHOTO_THRESHOLD
+
+
+def _looks_like_photo_by_texture(arr: np.ndarray, threshold: float = 0.87) -> bool:
     import cv2
 
     grey = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY).astype(np.int16)
